@@ -30,6 +30,14 @@ contour detection, as verified in the 2026-10-30/31 round-2 tests:
 This module does not do YOLO detection, embedding classification,
 or local OCR. Those are separate, separately-verified steps in
 the round-2 scratch tests and are not claimed by this module.
+
+Round-3 (detection-contours-v8n branch) adds OPTIONAL YOLO boxes
+via modules/yolo_detection.py (ONNX Runtime only, no torch).
+YOLO is off unless a model path is given: the default is the
+round-2 yolov8n-seg ONNX file, never yolo11s. YOLO boxes are
+merged only when they do not duplicate a contour box (IoU > 0.5
+is dropped as a duplicate). YOLO has no arrow class, so a YOLO
+box is never an arrow element.
 """
 
 import math
@@ -162,19 +170,45 @@ class DetectionContourExtractor:
     arrows. It never imports torch or SAM3.
     """
 
-    def __init__(self, config=None):
+    def __init__(self, config=None, yolo_model_path=None):
         self.config = config
+        # None = use yolo_detection.DEFAULT_YOLO_MODEL_PATH;
+        # "" (empty string) = YOLO disabled, round-2 behaviour.
+        self.yolo_model_path = yolo_model_path
 
-    def extract(self, image_path: str) -> Dict[str, Any]:
+    def extract(self, image_path: str, yolo_model_path=None) -> Dict[str, Any]:
         img = cv2.imread(image_path)
         if img is None:
             raise ValueError(f"cannot read image: {image_path}")
         h, w = img.shape[:2]
         boxes = detect_shape_boxes(img)
         arrows = detect_arrow_shafts(img, boxes)
+        # Optional YOLO boxes (round-3, v8n default, never yolo11s).
+        yolo_path = self.yolo_model_path if yolo_model_path is None else yolo_model_path
+        yolo_boxes = []
+        yolo_available = False
+        yolo_error = None
+        if yolo_path:
+            try:
+                from .yolo_detection import detect_yolo_boxes, iou_xyxy
+                raw = detect_yolo_boxes(img, model_path=yolo_path)
+                yolo_available = True
+                # Drop YOLO boxes duplicating a contour box (IoU > 0.5).
+                for d in raw:
+                    if any(iou_xyxy(d["bbox"], b["bbox"]) > 0.5 for b in boxes):
+                        d = dict(d); d["dropped_as_duplicate"] = True
+                        yolo_boxes.append(d)
+                    else:
+                        yolo_boxes.append(d)
+            except Exception as e:  # missing onnxruntime / model file: degrade, do not crash
+                yolo_error = f"{type(e).__name__}: {e}"
+        kept_yolo = [d for d in yolo_boxes if not d.get("dropped_as_duplicate")]
         return {
             "canvas_width": int(w), "canvas_height": int(h),
             "shapes": boxes, "arrows": arrows,
+            "yolo_boxes": yolo_boxes, "yolo_kept": kept_yolo,
+            "yolo_available": yolo_available, "yolo_error": yolo_error,
+            "yolo_model": yolo_path or None,
             "ocr_prompt": OCR_PROMPT_NEW, "ocr_params": dict(OCR_PARAMS),
         }
 
@@ -198,6 +232,14 @@ class DetectionContourExtractor:
                 score=0.5 if a["head_separated"] else 0.3,
                 polygon=[],
             ))
+        for d in result.get("yolo_kept", []):
+            x1, y1, x2, y2 = d["bbox"]
+            elements.append(ElementInfo(
+                id=len(elements), element_type="picture",
+                bbox=BoundingBox(x1=x1, y1=y1, x2=x2, y2=y2),
+                score=float(d.get("conf", 0.0)),
+                polygon=[[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+            ))
         context.elements = elements
         context.canvas_width = result["canvas_width"]
         context.canvas_height = result["canvas_height"]
@@ -210,6 +252,10 @@ class DetectionContourExtractor:
                 "shapes": len(result["shapes"]),
                 "arrows_shaft_confirmed": len(result["arrows"]),
                 "arrows_head_separated": sum(1 for a in result["arrows"] if a["head_separated"]),
+                "yolo_boxes": len(result.get("yolo_boxes", [])),
+                "yolo_kept": len(result.get("yolo_kept", [])),
+                "yolo_available": result.get("yolo_available", False),
+                "yolo_error": result.get("yolo_error"),
                 "sam3_used": False,
             },
         )
