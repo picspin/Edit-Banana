@@ -32,6 +32,7 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
 
 from modules import (
+    DetectionContourExtractor,
     # Core processors
     Sam3InfoExtractor,
     IconPictureProcessor,
@@ -51,8 +52,11 @@ from modules import (
     get_layer_level,
 )
 
-# Prompt groups enum
-from modules.sam3_info_extractor import PromptGroup
+# Prompt groups enum (SAM3-only; detection branch runs without torch)
+try:
+    from modules.sam3_info_extractor import PromptGroup
+except Exception:
+    PromptGroup = None
 
 # Text module available (depends on ocr/coord_processor etc.)
 TEXT_MODULE_AVAILABLE = TextRestorer is not None
@@ -106,6 +110,12 @@ class Pipeline:
         if self._sam3_extractor is None:
             self._sam3_extractor = Sam3InfoExtractor()
         return self._sam3_extractor
+
+    @property
+    def detection_extractor(self) -> DetectionContourExtractor:
+        if getattr(self, '_detection_extractor', None) is None:
+            self._detection_extractor = DetectionContourExtractor()
+        return self._detection_extractor
     
     @property
     def icon_processor(self) -> IconPictureProcessor:
@@ -185,11 +195,13 @@ class Pipeline:
             else:
                 print("\n[1] Text extraction (skipped)")
 
-            print("\n[2] Segmentation (SAM3)...")
+            print("\n[2] Segmentation (detection contours by default; SAM3 only if EDITBANANA_USE_SAM3=1)...")
 
             if groups:
                 # Extract by group
                 all_elements = []
+                if os.environ.get("EDITBANANA_USE_SAM3") != "1":
+                    raise Exception("Group extraction requires SAM3; set EDITBANANA_USE_SAM3=1 or use full detection extraction")
                 for group in groups:
                     result = self.sam3_extractor.extract_by_group(context, group)
                     all_elements.extend(result.elements)
@@ -199,19 +211,34 @@ class Pipeline:
                 context.canvas_width = result.canvas_width
                 context.canvas_height = result.canvas_height
             else:
-                # Full extraction
-                result = self.sam3_extractor.process(context)
-                if not result.success:
-                    raise Exception(f"SAM3 extraction failed: {result.error_message}")
-                context.elements = result.elements
-                context.canvas_width = result.canvas_width
-                context.canvas_height = result.canvas_height
-            
+                # Full extraction: detection contours by default in this
+                # branch (no SAM, no torch). SAM3 is opt-in only.
+                if os.environ.get("EDITBANANA_USE_SAM3") == "1":
+                    result = self.sam3_extractor.process(context)
+                    if not result.success:
+                        raise Exception(f"SAM3 extraction failed: {result.error_message}")
+                    context.elements = result.elements
+                    context.canvas_width = result.canvas_width
+                    context.canvas_height = result.canvas_height
+                else:
+                    result = self.detection_extractor.process(context)
+                    if not result.success:
+                        raise Exception(f"Detection extraction failed: {result.error_message}")
+                    context.elements = result.elements
+                    context.canvas_width = result.canvas_width
+                    context.canvas_height = result.canvas_height
+
             print(f"   Elements: {len(context.elements)}")
-            vis_path = os.path.join(img_output_dir, "sam3_extraction.png")
-            self.sam3_extractor.save_visualization(context, vis_path)
-            meta_path = os.path.join(img_output_dir, "sam3_metadata.json")
-            self.sam3_extractor.save_metadata(context, meta_path)
+            if os.environ.get("EDITBANANA_USE_SAM3") == "1":
+                vis_path = os.path.join(img_output_dir, "sam3_extraction.png")
+                self.sam3_extractor.save_visualization(context, vis_path)
+                meta_path = os.path.join(img_output_dir, "sam3_metadata.json")
+                self.sam3_extractor.save_metadata(context, meta_path)
+            else:
+                vis_path = os.path.join(img_output_dir, "detection_extraction.png")
+                self.detection_extractor.save_visualization(context, vis_path)
+                meta_path = os.path.join(img_output_dir, "detection_metadata.json")
+                self.detection_extractor.save_metadata(context, meta_path)
 
             print("\n[3] Shape/icon processing...")
             result = self.icon_processor.process(context)
