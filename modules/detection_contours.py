@@ -38,6 +38,18 @@ round-2 yolov8n-seg ONNX file, never yolo11s. YOLO boxes are
 merged only when they do not duplicate a contour box (IoU > 0.5
 is dropped as a duplicate). YOLO has no arrow class, so a YOLO
 box is never an arrow element.
+
+Round-4 (detection-contours-v8n branch) adds OPTIONAL FastSAM
+masks via modules/fastsam_detection.py (torch + ultralytics,
+lazy import only). FastSAM is off when its model path is "" and
+degrades (fastsam_available=False) when torch or the weights
+are missing, same convention as YOLO. FastSAM arrow instances
+are shaft+head as ONE mask, head_separated is always False,
+and an instance is only reported when the mask spans a gap
+between two contour shape boxes; dense-diagram long bars
+without such a gap are not arrows. FastSAM shape masks are
+reported for audit only and are NOT promoted to pipeline
+elements, to avoid the round-3 dense-diagram overfire.
 """
 
 import math
@@ -170,13 +182,19 @@ class DetectionContourExtractor:
     arrows. It never imports torch or SAM3.
     """
 
-    def __init__(self, config=None, yolo_model_path=None):
+    def __init__(self, config=None, yolo_model_path=None,
+                 fastsam_model_path=None):
         self.config = config
         # None = use yolo_detection.DEFAULT_YOLO_MODEL_PATH;
         # "" (empty string) = YOLO disabled, round-2 behaviour.
         self.yolo_model_path = yolo_model_path
+        # None = use fastsam_detection.DEFAULT_FASTSAM_MODEL_PATH;
+        # "" (empty string) = FastSAM disabled. Missing torch /
+        # weights degrades, it never crashes extraction.
+        self.fastsam_model_path = fastsam_model_path
 
-    def extract(self, image_path: str, yolo_model_path=None) -> Dict[str, Any]:
+    def extract(self, image_path: str, yolo_model_path=None,
+                  fastsam_model_path=None) -> Dict[str, Any]:
         img = cv2.imread(image_path)
         if img is None:
             raise ValueError(f"cannot read image: {image_path}")
@@ -203,12 +221,34 @@ class DetectionContourExtractor:
             except Exception as e:  # missing onnxruntime / model file: degrade, do not crash
                 yolo_error = f"{type(e).__name__}: {e}"
         kept_yolo = [d for d in yolo_boxes if not d.get("dropped_as_duplicate")]
+        # Optional FastSAM masks (round-4 integration, torch lazy).
+        fs_path = self.fastsam_model_path if fastsam_model_path is None else fastsam_model_path
+        fs_masks, fs_arrows, fs_kept, fs_dropped = [], [], [], []
+        fs_available, fs_error = False, None
+        if fs_path:
+            try:
+                from .fastsam_detection import detect_fastsam_masks, merge_fastsam
+                raw_fs = detect_fastsam_masks(img, model_path=fs_path)
+                merged = merge_fastsam(raw_fs, boxes, yolo_boxes)
+                fs_masks, fs_arrows = merged["masks"], merged["arrow_instances"]
+                fs_kept = merged["shape_candidates_kept"]
+                fs_dropped = merged["shape_candidates_dropped"]
+                fs_available = True
+            except Exception as e:  # missing torch/weights: degrade, do not crash
+                fs_error = f"{type(e).__name__}: {e}"
         return {
             "canvas_width": int(w), "canvas_height": int(h),
             "shapes": boxes, "arrows": arrows,
             "yolo_boxes": yolo_boxes, "yolo_kept": kept_yolo,
             "yolo_available": yolo_available, "yolo_error": yolo_error,
             "yolo_model": yolo_path or None,
+            "fastsam_masks": fs_masks,
+            "fastsam_arrow_instances": fs_arrows,
+            "fastsam_shapes_kept": fs_kept,
+            "fastsam_shapes_dropped": fs_dropped,
+            "fastsam_available": fs_available,
+            "fastsam_error": fs_error,
+            "fastsam_model": fs_path or None,
             "ocr_prompt": OCR_PROMPT_NEW, "ocr_params": dict(OCR_PARAMS),
         }
 
@@ -232,6 +272,33 @@ class DetectionContourExtractor:
                 score=0.5 if a["head_separated"] else 0.3,
                 polygon=[],
             ))
+        # FastSAM arrow instances: a mask that spans the same gap
+        # as a shaft-confirmed arrow CONFIRMS that arrow as an
+        # instance; it is NOT a second arrow element. Only an
+        # instance with no matching shaft gap becomes a new element.
+        # This keeps the synth element count at shapes + arrows
+        # instead of double-counting the same 2 arrows.
+        fs_matched, fs_new = 0, 0
+        for a in result.get("fastsam_arrow_instances", []):
+            x1, y1, x2, y2 = a["bbox"]
+            cy = (y1 + y2) / 2
+            matched = any(
+                x1 <= sa["from_box"][2] + 40
+                and x2 >= sa["to_box"][0] - 40
+                and abs(cy - (sa["from_box"][1] + sa["from_box"][3]) / 2) <= 30
+                for sa in result.get("arrows", []))
+            if matched:
+                fs_matched += 1
+                continue
+            fs_new += 1
+            elements.append(ElementInfo(
+                id=len(elements), element_type="arrow",
+                bbox=BoundingBox(x1=x1, y1=y1, x2=x2, y2=y2),
+                score=0.5,
+                polygon=[[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+            ))
+        result["_fastsam_matched_shaft"] = fs_matched
+        result["_fastsam_new"] = fs_new
         for d in result.get("yolo_kept", []):
             x1, y1, x2, y2 = d["bbox"]
             elements.append(ElementInfo(
@@ -256,6 +323,13 @@ class DetectionContourExtractor:
                 "yolo_kept": len(result.get("yolo_kept", [])),
                 "yolo_available": result.get("yolo_available", False),
                 "yolo_error": result.get("yolo_error"),
+                "fastsam_masks": len(result.get("fastsam_masks", [])),
+                "fastsam_arrow_instances": len(result.get("fastsam_arrow_instances", [])),
+                "fastsam_shapes_kept": len(result.get("fastsam_shapes_kept", [])),
+                "fastsam_available": result.get("fastsam_available", False),
+                "fastsam_error": result.get("fastsam_error"),
+                "fastsam_arrow_instances_matched_shaft": result.get("_fastsam_matched_shaft", 0),
+                "fastsam_arrow_instances_new": result.get("_fastsam_new", 0),
                 "sam3_used": False,
             },
         )
