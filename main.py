@@ -309,14 +309,35 @@ class Pipeline:
             
             elem_type = elem.element_type.lower()
             
-            if elem_type in {'icon', 'picture', 'logo', 'chart', 'function_graph', 'arrow', 'line', 'connector'}:
-                # Image/arrow: use base64 image
+            if elem_type in {'arrow', 'line', 'connector'}:
+                if elem.arrow_start and elem.arrow_end:
+                    sx, sy = elem.arrow_start
+                    tx, ty = elem.arrow_end
+                    pts_xml = ""
+                    if elem.vector_points:
+                        inner_pts = "\n".join([f'      <mxPoint x="{p[0]}" y="{p[1]}"/>' for p in elem.vector_points])
+                        pts_xml = f'''\n    <Array as="points">\n{inner_pts}\n    </Array>'''
+                    edge_style = "edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;strokeColor=#000000;strokeWidth=2;"
+                    elem.layer_level = LayerLevel.ARROW.value
+                    elem.xml_fragment = f'''<mxCell id="{elem.id}" parent="1" edge="1" style="{edge_style}">
+  <mxGeometry relative="1" as="geometry">
+    <mxPoint x="{sx}" y="{sy}" as="sourcePoint"/>
+    <mxPoint x="{tx}" y="{ty}" as="targetPoint"/>{pts_xml}
+  </mxGeometry>
+</mxCell>'''
+                    continue
+                # Fallback to image crop if no vector endpoints
                 if elem.base64:
                     style = f"shape=image;imageAspect=0;aspect=fixed;verticalLabelPosition=bottom;verticalAlign=top;image=data:image/png,{elem.base64}"
                 else:
                     style = "rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;"
                 elem.layer_level = LayerLevel.IMAGE.value
-                
+            elif elem_type in {'icon', 'picture', 'logo', 'chart', 'function_graph'}:
+                if elem.base64:
+                    style = f"shape=image;imageAspect=0;aspect=fixed;verticalLabelPosition=bottom;verticalAlign=top;image=data:image/png,{elem.base64}"
+                else:
+                    style = "rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;"
+                elem.layer_level = LayerLevel.IMAGE.value
             elif elem_type in {'section_panel', 'title_bar'}:
                 # Background/container
                 fill = elem.fill_color or "#ffffff"

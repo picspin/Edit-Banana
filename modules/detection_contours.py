@@ -453,6 +453,9 @@ class DetectionContourExtractor:
                 abox = [min(p[0] for p in wpts), min(p[1] for p in wpts),
                         max(p[0] for p in wpts), max(p[1] for p in wpts)]
                 poly = wpts
+                arrow_start = tuple(wpts[0])
+                arrow_end = tuple(wpts[-1])
+                vector_points = wpts[1:-1]
             else:
                 fb = a["from_box"]
                 tb = a["to_box"]
@@ -460,21 +463,31 @@ class DetectionContourExtractor:
                 tcx, tcy = (tb[0] + tb[2]) / 2, (tb[1] + tb[3]) / 2
                 if abs(fcy - tcy) <= 30 and fb[2] < tb[0]:
                     abox = [fb[2], min(fb[1], tb[1]), tb[0], max(fb[3], tb[3])]
+                    arrow_start = (fb[2], int((fb[1] + fb[3]) / 2))
+                    arrow_end = (tb[0], int((tb[1] + tb[3]) / 2))
                 elif abs(fcx - tcx) <= 30 and fb[3] < tb[1]:
                     abox = [min(fb[0], tb[0]), fb[3], max(fb[2], tb[2]), tb[1]]
+                    arrow_start = (int((fb[0] + fb[2]) / 2), fb[3])
+                    arrow_end = (int((tb[0] + tb[2]) / 2), tb[1])
                 else:
                     ex_x = fb[0] if tcx < fcx else fb[2]
                     ex_y = fb[1] if tcy < fcy else fb[3]
                     en_x = tb[2] if tcx < fcx else tb[0]
                     en_y = tb[3] if tcy < fcy else tb[1]
                     abox = [min(ex_x, en_x), min(ex_y, en_y), max(ex_x, en_x), max(ex_y, en_y)]
+                    arrow_start = (ex_x, ex_y)
+                    arrow_end = (en_x, en_y)
                 poly = []
+                vector_points = []
             x1, y1, x2, y2 = abox
             elements.append(ElementInfo(
                 id=len(elements), element_type="arrow",
                 bbox=BoundingBox(x1=x1, y1=y1, x2=x2, y2=y2),
                 score=0.5 if a.get("head_separated") else 0.3,
                 polygon=poly,
+                arrow_start=arrow_start,
+                arrow_end=arrow_end,
+                vector_points=vector_points,
             ))
         # FastSAM arrow instances: a mask that spans the same gap
         # as a shaft-confirmed arrow CONFIRMS that arrow as an
