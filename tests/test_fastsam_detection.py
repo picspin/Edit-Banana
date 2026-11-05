@@ -51,7 +51,20 @@ class TestMergeLogicNoModel(unittest.TestCase):
             iou_xyxy([0, 0, 100, 100], [0, 0, 100, 100]), 1.0)
         self.assertEqual(iou_xyxy([0, 0, 10, 10], [20, 20, 30, 30]), 0.0)
 
-    def test_gap_arrow_kept_and_head_never_separated(self):
+    def test_gap_arrow_kept_and_head_separated_when_head_present(self):
+        masks = [
+            {"bbox": [432, 167, 590, 185], "area_work": 1414,
+             "area": 1414, "approx_vertices": 4, "method": "fastsam-s"},
+            {"bbox": [569, 167, 590, 186], "area_work": 266,
+             "area": 266, "approx_vertices": 6, "method": "fastsam-s"},
+        ]
+        out = classify_arrow_instances(masks, SYNTH_BOXES)
+        self.assertEqual(len(out), 1)
+        self.assertTrue(out[0]["arrow_instance"])
+        self.assertTrue(out[0]["head_separated"])
+        self.assertEqual(out[0]["head_bbox"], [569, 167, 590, 186])
+
+    def test_gap_arrow_without_head_mask_has_head_separated_false(self):
         masks = [{"bbox": [432, 167, 590, 185], "area_work": 1414,
                   "area": 1414, "approx_vertices": 4,
                   "method": "fastsam-s"}]
@@ -68,14 +81,21 @@ class TestMergeLogicNoModel(unittest.TestCase):
         out = classify_arrow_instances(masks, SYNTH_BOXES)
         self.assertEqual(len(out), 0)
 
-    def test_shape_duplicate_dropped(self):
+    def test_shape_candidate_kept_when_matches_shape(self):
         masks = [{"bbox": [114, 114, 427, 237], "area_work": 100000,
                   "area": 100000, "approx_vertices": 4,
                   "method": "fastsam-s"}]
         kept, dropped = classify_shape_candidates(masks, SYNTH_BOXES)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(len(dropped), 0)
+
+    def test_unmatched_shape_candidate_dropped(self):
+        masks = [{"bbox": [1, 500, 100, 600], "area_work": 10000,
+                  "area": 10000, "approx_vertices": 4,
+                  "method": "fastsam-s"}]
+        kept, dropped = classify_shape_candidates(masks, SYNTH_BOXES)
         self.assertEqual(len(kept), 0)
         self.assertEqual(len(dropped), 1)
-
     def test_merge_returns_audit_fields(self):
         m = merge_fastsam([], SYNTH_BOXES)
         self.assertEqual(m["arrow_instances"], [])
@@ -126,22 +146,19 @@ class TestFastsamLive(unittest.TestCase):
                 got, [(432, 167, 590, 185), (432, 647, 590, 665)]):
             for g, w in zip(got_box, want):
                 self.assertLessEqual(abs(g - w), 10)
-        self.assertTrue(all(not a["head_separated"] for a in arrows))
+        self.assertTrue(all(a["head_separated"] for a in arrows))
 
-    def test_single_chain_arrow_instances_are_zero_known_limit(self):
-        # Round-4 history: 52 masks, 0 arrow instances, because the
-        # single-chain arrows are diagonal, not horizontal
-        # gap-spanning masks. 0 here is a recorded limitation,
-        # not a success claim; the classifier must not invent
-        # instances to fill the 3 arrows.
+    def test_single_chain_arrow_instances_detected(self):
         import cv2
         img = cv2.imread(SINGLE)
         masks = detect_fastsam_masks(img, model_path=WEIGHTS)
-        from modules.detection_contours import detect_shape_boxes
+        from modules.detection_contours import detect_shape_boxes, detect_arrow_shafts
         shapes = detect_shape_boxes(img)
-        arrows = classify_arrow_instances(masks, shapes)
-        self.assertEqual(len(arrows), 0)
-
+        shafts = detect_arrow_shafts(img, shapes)
+        self.assertEqual(len(shafts), 3)
+        arrows = classify_arrow_instances(masks, shapes, shafts=shafts)
+        self.assertEqual(len(arrows), 3)
+        self.assertTrue(all(a["head_separated"] for a in arrows))
 
 class TestFastsamProcessDedup(unittest.TestCase):
     @unittest.skipUnless(fastsam_available(),
@@ -166,7 +183,30 @@ class TestFastsamProcessDedup(unittest.TestCase):
         self.assertEqual(
             res.metadata["fastsam_arrow_instances_matched_shaft"], 2)
         self.assertEqual(res.metadata["fastsam_arrow_instances_new"], 0)
+        self.assertEqual(res.metadata["arrows_head_separated"], 2)
 
+    @unittest.skipUnless(fastsam_available(),
+                         "FastSAM torch/weights unavailable")
+    def test_single_chain_process_all_arrows_detected(self):
+        from modules.detection_contours import DetectionContourExtractor
+        class Ctx:
+            def __init__(self):
+                self.image_path = SINGLE
+                self.elements = []
+                self.canvas_width = 0
+                self.canvas_height = 0
+                self.intermediate_results = {}
+        ctx = Ctx()
+        ex = DetectionContourExtractor(
+            yolo_model_path="",
+            fastsam_model_path=WEIGHTS)
+        res = ex.process(ctx)
+        # 4 shapes + 3 shaft arrows (all confirmed by FastSAM)
+        self.assertEqual(len(ctx.elements), 7)
+        self.assertEqual(
+            res.metadata["fastsam_arrow_instances_matched_shaft"], 3)
+        self.assertEqual(res.metadata["fastsam_arrow_instances_new"], 0)
+        self.assertEqual(res.metadata["arrows_head_separated"], 3)
 
 if __name__ == "__main__":
     unittest.main()

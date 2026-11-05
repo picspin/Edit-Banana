@@ -115,7 +115,7 @@ def detect_arrow_shafts(image_bgr: np.ndarray, boxes: List[Dict[str, Any]]) -> L
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 50, 150)
     hl = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80,
-                         minLineLength=60, maxLineGap=10)
+                         minLineLength=60, maxLineGap=50)
     lines = []
     if hl is not None:
         for x1, y1, x2, y2 in hl.reshape(-1, 4):
@@ -136,6 +136,12 @@ def detect_arrow_shafts(image_bgr: np.ndarray, boxes: List[Dict[str, Any]]) -> L
         if w > 60 or h > 60 or not (0.5 <= w / max(1, h) <= 2.0):
             continue
         heads.append([int(x), int(y), int(w), int(h)])
+
+    def _dist_to_box(bx: List[int], x: float, y: float) -> float:
+        dx = max(0, bx[0] - x, x - bx[2])
+        dy = max(0, bx[1] - y, y - bx[3])
+        return math.hypot(dx, dy)
+
     arrows = []
     for a in boxes:
         for b in boxes:
@@ -143,34 +149,64 @@ def detect_arrow_shafts(image_bgr: np.ndarray, boxes: List[Dict[str, Any]]) -> L
                 continue
             ax1, ay1, ax2, ay2 = a["bbox"]
             bx1, by1, bx2, by2 = b["bbox"]
-            # same row, a left of b, with a gap
-            if abs((ay1 + ay2) / 2 - (by1 + by2) / 2) > 30:
-                continue
-            if not (ax2 < bx1):
-                continue
-            gap = bx1 - ax2
-            if gap < 10:
-                continue
-            cy = (ay1 + ay2) / 2
-            # Inner boxes are inset ~4 px, so the shaft line ends
-            # ~27 px before the inner box edge; allow 40 px slack
-            # for matching only (returned bboxes stay inner).
-            shaft = any(
-                abs(y1 - cy) < 20 and abs(y2 - cy) < 20
-                and min(x1, x2) <= ax2 + 40 and max(x1, x2) >= bx1 - 40
-                for x1, y1, x2, y2 in lines
-            )
-            if not shaft:
-                continue
-            head = any(
-                abs(hx + hw / 2 - bx1) < 40 and abs(hy + hh / 2 - cy) < 40
-                for hx, hy, hw, hh in heads
-            )
-            arrows.append({
-                "from_box": a["bbox"], "to_box": b["bbox"],
-                "shaft_confirmed": True, "head_separated": bool(head),
-                "method": "hough_shaft_between_boxes",
-            })
+            # 1. Horizontal arrow (same row, a left of b, with a gap)
+            if abs((ay1 + ay2) / 2 - (by1 + by2) / 2) <= 30 and ax2 < bx1:
+                gap = bx1 - ax2
+                if gap < 10:
+                    continue
+                cy = (ay1 + ay2) / 2
+                slack = max(40, int(gap * 0.35))
+                shaft = any(
+                    abs(y1 - cy) < 25 and abs(y2 - cy) < 25
+                    and min(x1, x2) <= ax2 + slack and max(x1, x2) >= bx1 - slack
+                    for x1, y1, x2, y2 in lines
+                )
+                if shaft:
+                    head = any(
+                        abs(hx + hw / 2 - bx1) < 40 and abs(hy + hh / 2 - cy) < 40
+                        for hx, hy, hw, hh in heads
+                    )
+                    arrows.append({
+                        "from_box": a["bbox"], "to_box": b["bbox"],
+                        "shaft_confirmed": True, "head_separated": bool(head),
+                        "method": "hough_shaft_between_boxes",
+                    })
+                    continue
+
+            # 2. Diagonal / connecting arrow (a above b with gap, non-overlapping)
+            if ay2 <= by1 + 10:
+                gap = math.hypot(max(0, ax1 - bx2, bx1 - ax2), max(0, ay1 - by2, by1 - ay2))
+                if gap < 30:
+                    continue
+                cax, cay = (ax1 + ax2) / 2, (ay1 + ay2) / 2
+                cbx, cby = (bx1 + bx2) / 2, (by1 + by2) / 2
+                box_ang = math.atan2(cby - cay, cbx - cax)
+                for x1, y1, x2, y2 in lines:
+                    d1a = _dist_to_box(a["bbox"], x1, y1)
+                    d2b = _dist_to_box(b["bbox"], x2, y2)
+                    d2a = _dist_to_box(a["bbox"], x2, y2)
+                    d1b = _dist_to_box(b["bbox"], x1, y1)
+                    match = False
+                    if d1a <= 40 and d2b <= 40:
+                        line_ang = math.atan2(y2 - y1, x2 - x1)
+                        match = True
+                    elif d2a <= 40 and d1b <= 40:
+                        line_ang = math.atan2(y1 - y2, x1 - x2)
+                        match = True
+                    if match:
+                        diff = abs(line_ang - box_ang)
+                        diff = min(diff, 2 * math.pi - diff)
+                        if diff < math.radians(20):
+                            head = any(
+                                _dist_to_box(b["bbox"], hx + hw / 2, hy + hh / 2) < 40
+                                for hx, hy, hw, hh in heads
+                            )
+                            arrows.append({
+                                "from_box": a["bbox"], "to_box": b["bbox"],
+                                "shaft_confirmed": True, "head_separated": bool(head),
+                                "method": "hough_shaft_between_boxes",
+                            })
+                            break
     return arrows
 
 
@@ -229,11 +265,22 @@ class DetectionContourExtractor:
             try:
                 from .fastsam_detection import detect_fastsam_masks, merge_fastsam
                 raw_fs = detect_fastsam_masks(img, model_path=fs_path)
-                merged = merge_fastsam(raw_fs, boxes, yolo_boxes)
+                merged = merge_fastsam(raw_fs, boxes, yolo_boxes, shafts=arrows)
                 fs_masks, fs_arrows = merged["masks"], merged["arrow_instances"]
                 fs_kept = merged["shape_candidates_kept"]
                 fs_dropped = merged["shape_candidates_dropped"]
                 fs_available = True
+                # Propagate FastSAM detected heads to arrow shafts
+                for a in arrows:
+                    for fsa in fs_arrows:
+                        if fsa.get("head_separated") and fsa.get("head_bbox"):
+                            hbx = fsa["head_bbox"]
+                            hcx, hcy = (hbx[0] + hbx[2]) / 2, (hbx[1] + hbx[3]) / 2
+                            dx = max(0, a["to_box"][0] - hcx, hcx - a["to_box"][2])
+                            dy = max(0, a["to_box"][1] - hcy, hcy - a["to_box"][3])
+                            if math.hypot(dx, dy) <= 40:
+                                a["head_separated"] = True
+                                a["head_bbox"] = fsa["head_bbox"]
             except Exception as e:  # missing torch/weights: degrade, do not crash
                 fs_error = f"{type(e).__name__}: {e}"
         return {
@@ -264,12 +311,25 @@ class DetectionContourExtractor:
                 score=1.0, polygon=[[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
             ))
         for j, a in enumerate(result["arrows"]):
-            x1 = a["from_box"][2]; y1 = a["from_box"][1]
-            x2 = a["to_box"][0]; y2 = a["to_box"][3]
+            fb = a["from_box"]
+            tb = a["to_box"]
+            fcx, fcy = (fb[0] + fb[2]) / 2, (fb[1] + fb[3]) / 2
+            tcx, tcy = (tb[0] + tb[2]) / 2, (tb[1] + tb[3]) / 2
+            if abs(fcy - tcy) <= 30 and fb[2] < tb[0]:
+                abox = [fb[2], min(fb[1], tb[1]), tb[0], max(fb[3], tb[3])]
+            elif abs(fcx - tcx) <= 30 and fb[3] < tb[1]:
+                abox = [min(fb[0], tb[0]), fb[3], max(fb[2], tb[2]), tb[1]]
+            else:
+                ex_x = fb[0] if tcx < fcx else fb[2]
+                ex_y = fb[1] if tcy < fcy else fb[3]
+                en_x = tb[2] if tcx < fcx else tb[0]
+                en_y = tb[3] if tcy < fcy else tb[1]
+                abox = [min(ex_x, en_x), min(ex_y, en_y), max(ex_x, en_x), max(ex_y, en_y)]
+            x1, y1, x2, y2 = abox
             elements.append(ElementInfo(
                 id=len(elements), element_type="arrow",
                 bbox=BoundingBox(x1=x1, y1=y1, x2=x2, y2=y2),
-                score=0.5 if a["head_separated"] else 0.3,
+                score=0.5 if a.get("head_separated") else 0.3,
                 polygon=[],
             ))
         # FastSAM arrow instances: a mask that spans the same gap
@@ -283,9 +343,10 @@ class DetectionContourExtractor:
             x1, y1, x2, y2 = a["bbox"]
             cy = (y1 + y2) / 2
             matched = any(
-                x1 <= sa["from_box"][2] + 40
-                and x2 >= sa["to_box"][0] - 40
-                and abs(cy - (sa["from_box"][1] + sa["from_box"][3]) / 2) <= 30
+                (a.get("from_box") == sa.get("from_box") and a.get("to_box") == sa.get("to_box")) or
+                (x1 <= sa["from_box"][2] + 40
+                 and x2 >= sa["to_box"][0] - 40
+                 and abs(cy - (sa["from_box"][1] + sa["from_box"][3]) / 2) <= 30)
                 for sa in result.get("arrows", []))
             if matched:
                 fs_matched += 1
@@ -318,7 +379,7 @@ class DetectionContourExtractor:
             metadata={
                 "shapes": len(result["shapes"]),
                 "arrows_shaft_confirmed": len(result["arrows"]),
-                "arrows_head_separated": sum(1 for a in result["arrows"] if a["head_separated"]),
+                "arrows_head_separated": sum(1 for a in result["arrows"] if a.get("head_separated")),
                 "yolo_boxes": len(result.get("yolo_boxes", [])),
                 "yolo_kept": len(result.get("yolo_kept", [])),
                 "yolo_available": result.get("yolo_available", False),

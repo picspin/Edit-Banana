@@ -37,12 +37,12 @@ overridable via EDITBANANA_FASTSAM_MODEL; see
 docs/fastsam-model-packaging.md for bundle/download options.
 """
 
+import math
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import cv2
 import numpy as np
-
 # Round-3 scratch weights, read-only reference. Production
 # deployment should bundle this file with the app instead of
 # relying on a scratch path; the path is overridable via
@@ -124,18 +124,48 @@ def detect_fastsam_masks(image_bgr, model_path=None, conf=0.4,
     return dets
 
 
-def classify_arrow_instances(masks, shape_boxes):
-    """Gap-spanning FastSAM arrow instances only.
+def _dist_to_box(bx: List[int], x: float, y: float) -> float:
+    dx = max(0, bx[0] - x, x - bx[2])
+    dy = max(0, bx[1] - y, y - bx[3])
+    return math.hypot(dx, dy)
 
-    A mask is an arrow instance only if it is elongated
-    (width >= 80, height <= 45, area_work >= 800, as in round 3),
-    does not duplicate a contour shape box (IoU <= 0.5), and
-    spans the gap between two shape boxes on the same row
-    (centre-line difference <= 30, mask reaches within 40 px of
-    both gap edges). head_separated is always False: FastSAM
-    gives shaft+head as one mask, never a separate head mask.
+
+def classify_arrow_instances(masks, shape_boxes, shafts=None):
+    """Classify FastSAM arrow instances and separate arrow heads.
+
+    Handles:
+    1. Elongated masks (shaft+head as one mask, as in synth):
+       If a compact triangular/wedge arrowhead mask is also detected
+       at the destination end of the arrow, head_separated is True
+       and head_bbox is recorded. If no separate head mask is
+       present, head_separated is False.
+    2. Thin-shaft arrows with separated arrowhead masks (as in single-chain):
+       When FastSAM segments the arrowhead mask (compact, 10-80 px,
+       ar 0.5-2.0) in the gap between shape boxes, it is associated
+       with the connecting shaft (if provided) or shape box pair to
+       form an arrow instance with head_separated=True.
+    3. Diagonal / connecting arrows between shape boxes.
     """
+    # Detect compact arrowhead masks (outside shape boxes)
+    head_masks = []
+    for m in masks:
+        x1, y1, x2, y2 = m["bbox"]
+        w, h = x2 - x1, y2 - y1
+        area = m.get("area_work", 0)
+        ar = w / max(1, h)
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        in_shape = any(
+            b["bbox"][0] <= cx <= b["bbox"][2] and b["bbox"][1] <= cy <= b["bbox"][3]
+            for b in shape_boxes
+        )
+        if not in_shape and 10 <= w <= 80 and 10 <= h <= 80 and 100 <= area <= 2000 and 0.5 <= ar <= 2.0:
+            head_masks.append(m)
+
     out = []
+    used_head_indices = set()
+    seen_pairs = set()
+
+    # Step 1: Elongated full arrow masks (horizontal gap-spanning)
     for d in masks:
         x1, y1, x2, y2 = d["bbox"]
         w, h = x2 - x1, y2 - y1
@@ -144,7 +174,6 @@ def classify_arrow_instances(masks, shape_boxes):
         if any(iou_xyxy(d["bbox"], b["bbox"]) > 0.5 for b in shape_boxes):
             continue
         cy = (y1 + y2) / 2
-        spans = False
         for a in shape_boxes:
             for b in shape_boxes:
                 if a is b:
@@ -158,22 +187,127 @@ def classify_arrow_instances(masks, shape_boxes):
                 if abs(cy - (ay1 + ay2) / 2) > 30:
                     continue
                 if x1 <= ax2 + 40 and x2 >= bx1 - 40:
-                    spans = True
-        if not spans:
-            continue
-        out.append(dict(d, arrow_instance=True, head_separated=False,
-                        method="fastsam-s-instance"))
+                    sep_head = None
+                    for idx, hm in enumerate(head_masks):
+                        hx1, hy1, hx2, hy2 = hm["bbox"]
+                        if (x1 <= (hx1 + hx2) / 2 <= x2 and
+                                abs((hy1 + hy2) / 2 - cy) <= 20 and
+                                (hx1 + hx2) / 2 >= (x1 + x2) / 2):
+                            sep_head = hm
+                            used_head_indices.add(idx)
+                            break
+                    pair = (a["bbox"][0], a["bbox"][1], b["bbox"][0], b["bbox"][1])
+                    seen_pairs.add(pair)
+                    out.append(dict(
+                        d, arrow_instance=True,
+                        head_separated=bool(sep_head is not None),
+                        head_bbox=sep_head["bbox"] if sep_head else None,
+                        from_box=a["bbox"], to_box=b["bbox"],
+                        method="fastsam-s-instance"
+                    ))
+
+    # Step 2: Associate unused arrowhead masks with confirmed shafts (when provided)
+    if shafts is not None:
+        for sa in shafts:
+            pair = (sa["from_box"][0], sa["from_box"][1], sa["to_box"][0], sa["to_box"][1])
+            if pair in seen_pairs:
+                continue
+            to_box = sa["to_box"]
+            from_box = sa["from_box"]
+            for idx, hm in enumerate(head_masks):
+                if idx in used_head_indices:
+                    continue
+                hx1, hy1, hx2, hy2 = hm["bbox"]
+                hcx, hcy = (hx1 + hx2) / 2, (hy1 + hy2) / 2
+                if _dist_to_box(to_box, hcx, hcy) <= 40:
+                    used_head_indices.add(idx)
+                    seen_pairs.add(pair)
+                    if (abs((from_box[1] + from_box[3]) / 2 - (to_box[1] + to_box[3]) / 2) <= 30
+                            and from_box[2] < to_box[0]):
+                        bbox = [from_box[2], hy1, hx2, hy2]
+                    else:
+                        bbox = [min(from_box[2], hx1), min(from_box[3], hy1),
+                                max(from_box[0], hx2), max(from_box[1], hy2)]
+                    out.append({
+                        "bbox": bbox,
+                        "area": hm.get("area", 0),
+                        "area_work": hm.get("area_work", 0),
+                        "arrow_instance": True,
+                        "head_separated": True,
+                        "head_bbox": hm["bbox"],
+                        "from_box": from_box,
+                        "to_box": to_box,
+                        "method": "fastsam-s-head-instance",
+                    })
+                    break
+    else:
+        # Step 3: Standalone / test mode without shafts: associate unused heads bridging shape boxes
+        for idx, hm in enumerate(head_masks):
+            if idx in used_head_indices:
+                continue
+            hx1, hy1, hx2, hy2 = hm["bbox"]
+            hcx, hcy = (hx1 + hx2) / 2, (hy1 + hy2) / 2
+            for a in shape_boxes:
+                for b in shape_boxes:
+                    if a is b:
+                        continue
+                    pair = (a["bbox"][0], a["bbox"][1], b["bbox"][0], b["bbox"][1])
+                    if pair in seen_pairs:
+                        continue
+                    ax1, ay1, ax2, ay2 = a["bbox"]
+                    bx1, by1, bx2, by2 = b["bbox"]
+                    # Horizontal
+                    if abs((ay1 + ay2) / 2 - (by1 + by2) / 2) <= 30 and ax2 < bx1:
+                        cy = (ay1 + ay2) / 2
+                        if abs(hcy - cy) <= 25 and ax2 <= hcx <= bx1 and _dist_to_box(b["bbox"], hcx, hcy) <= 40:
+                            used_head_indices.add(idx)
+                            seen_pairs.add(pair)
+                            out.append({
+                                "bbox": [ax2, hy1, hx2, hy2],
+                                "area": hm.get("area", 0),
+                                "area_work": hm.get("area_work", 0),
+                                "arrow_instance": True,
+                                "head_separated": True,
+                                "head_bbox": hm["bbox"],
+                                "from_box": a["bbox"],
+                                "to_box": b["bbox"],
+                                "method": "fastsam-s-head-instance",
+                            })
+                    # Diagonal (a above b)
+                    elif ay2 <= by1 + 10:
+                        gap = math.hypot(max(0, ax1 - bx2, bx1 - ax2), max(0, ay1 - by2, by1 - ay2))
+                        if gap >= 30 and _dist_to_box(b["bbox"], hcx, hcy) <= 40:
+                            cax, cay = (ax1 + ax2) / 2, (ay1 + ay2) / 2
+                            cbx, cby = (bx1 + bx2) / 2, (by1 + by2) / 2
+                            head_ang = math.atan2(hcy - cay, hcx - cax)
+                            box_ang = math.atan2(cby - cay, cbx - cax)
+                            diff = abs(head_ang - box_ang)
+                            diff = min(diff, 2 * math.pi - diff)
+                            if diff < math.radians(25):
+                                used_head_indices.add(idx)
+                                seen_pairs.add(pair)
+                                out.append({
+                                    "bbox": [min(hx1, int(cax)), min(ay2, hy1),
+                                             max(hx2, int(cax)), max(ay2, hy2)],
+                                    "area": hm.get("area", 0),
+                                    "area_work": hm.get("area_work", 0),
+                                    "arrow_instance": True,
+                                    "head_separated": True,
+                                    "head_bbox": hm["bbox"],
+                                    "from_box": a["bbox"],
+                                    "to_box": b["bbox"],
+                                    "method": "fastsam-s-head-instance",
+                                })
     return out
 
 
-def classify_shape_candidates(masks, shape_boxes):
-    """Large rectangular FastSAM masks not duplicating a shape box.
+def classify_shape_candidates(masks, shape_boxes, iou_thresh=0.5):
+    """Large rectangular FastSAM masks evaluated against shape boxes.
 
-    These are reported for audit (kept) but are NOT promoted to
-    pipeline elements by detection_contours.process(): on dense
-    diagrams most such masks are panels/text, not flowchart
-    boxes, and promoting them would overfire. Duplicates
-    (IoU > 0.5 vs a contour shape) are dropped.
+    FastSAM rectangular masks matching a contour shape box with
+    IoU >= iou_thresh are KEPT (confirmed as valid diagram shapes).
+    Masks with IoU < iou_thresh (unmatched noise / background)
+    are DROPPED.
     """
     kept, dropped = [], []
     for d in masks:
@@ -182,35 +316,34 @@ def classify_shape_candidates(masks, shape_boxes):
         if not (d.get("area", 0) >= 5000 and w >= 50 and h >= 30
                 and d.get("approx_vertices") == 4):
             continue
-        if any(iou_xyxy(d["bbox"], b["bbox"]) > 0.5 for b in shape_boxes):
-            dropped.append(dict(d, dropped_as_duplicate=True))
+        if any(iou_xyxy(d["bbox"], b["bbox"]) >= iou_thresh for b in shape_boxes):
+            kept.append(dict(d, confirmed_by_contour=True))
         else:
-            kept.append(d)
+            dropped.append(dict(d, dropped_as_unmatched=True))
     return kept, dropped
 
 
-def merge_fastsam(masks, shape_boxes, yolo_boxes=None):
+def merge_fastsam(masks, shape_boxes, yolo_boxes=None, shafts=None):
     """Merge FastSAM masks with contour (+YOLO) boxes by IoU.
 
-    Returns arrow instances, kept shape candidates, dropped
-    duplicates (also dropped when duplicating a kept YOLO box),
-    and the full mask list for audit. YOLO boxes have no arrow
-    class, so they only affect shape dedup, never arrows.
+    Returns arrow instances (with head separation), kept shape
+    candidates (confirmed by contour or YOLO), dropped candidates
+    (unmatched), and full mask list for audit.
     """
-    arrows = classify_arrow_instances(masks, shape_boxes)
+    arrows = classify_arrow_instances(masks, shape_boxes, shafts=shafts)
     kept, dropped = classify_shape_candidates(masks, shape_boxes)
     yolo_kept = [d for d in (yolo_boxes or [])
                  if not d.get("dropped_as_duplicate")]
-    extra_dropped = []
-    still_kept = []
-    for d in kept:
-        if any(iou_xyxy(d["bbox"], y["bbox"]) > 0.5 for y in yolo_kept):
-            extra_dropped.append(dict(d, dropped_as_duplicate=True))
+    still_dropped = []
+    yolo_confirmed = []
+    for d in dropped:
+        if any(iou_xyxy(d["bbox"], y["bbox"]) >= 0.5 for y in yolo_kept):
+            yolo_confirmed.append(dict(d, confirmed_by_yolo=True))
         else:
-            still_kept.append(d)
+            still_dropped.append(d)
     return {
         "masks": masks,
         "arrow_instances": arrows,
-        "shape_candidates_kept": still_kept,
-        "shape_candidates_dropped": dropped + extra_dropped,
+        "shape_candidates_kept": kept + yolo_confirmed,
+        "shape_candidates_dropped": still_dropped,
     }
