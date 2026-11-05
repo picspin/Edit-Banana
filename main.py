@@ -317,9 +317,11 @@ class Pipeline:
                     if elem.vector_points:
                         inner_pts = "\n".join([f'      <mxPoint x="{p[0]}" y="{p[1]}"/>' for p in elem.vector_points])
                         pts_xml = f'''\n    <Array as="points">\n{inner_pts}\n    </Array>'''
+                    source_attr = f' source="{elem.source_id}"' if elem.source_id is not None else ""
+                    target_attr = f' target="{elem.target_id}"' if elem.target_id is not None else ""
                     edge_style = "edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;strokeColor=#000000;strokeWidth=2;"
                     elem.layer_level = LayerLevel.ARROW.value
-                    elem.xml_fragment = f'''<mxCell id="{elem.id}" parent="1" edge="1" style="{edge_style}">
+                    elem.xml_fragment = f'''<mxCell id="{elem.id}" parent="1" edge="1"{source_attr}{target_attr} style="{edge_style}">
   <mxGeometry relative="1" as="geometry">
     <mxPoint x="{sx}" y="{sy}" as="sourcePoint"/>
     <mxPoint x="{tx}" y="{ty}" as="targetPoint"/>{pts_xml}
@@ -343,8 +345,17 @@ class Pipeline:
                 fill = elem.fill_color or "#ffffff"
                 stroke = elem.stroke_color or "#000000"
                 style = f"rounded=0;whiteSpace=wrap;html=1;fillColor={fill};strokeColor={stroke};dashed=1;"
-                elem.layer_level = LayerLevel.BACKGROUND.value
-                
+            elif (elem_type in {'edge_label', 'text'} or elem.edge_parent_id) and elem.edge_offset:
+                ox, oy = elem.edge_offset
+                label_val = elem.text_content or ""
+                label_style = "edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];"
+                elem.layer_level = LayerLevel.TEXT.value
+                elem.xml_fragment = f'''<mxCell id="{elem.id}" value="{label_val}" style="{label_style}" parent="{elem.edge_parent_id}" vertex="1" connectable="0">
+  <mxGeometry relative="1" as="geometry">
+    <mxPoint x="{ox}" y="{oy}" as="offset"/>
+  </mxGeometry>
+</mxCell>'''
+                continue
             else:
                 # Basic shape
                 fill = elem.fill_color or "#ffffff"

@@ -21,10 +21,13 @@ from modules.fastsam_detection import (
 )
 from modules.detection_contours import (
     DetectionContourExtractor,
+    bind_edge_label_to_arrow,
     detect_arrow_shafts,
     detect_elbow_connectors,
     detect_shape_boxes,
 )
+from modules.xml_merger import XMLMerger, XMLFragment
+from modules.data_types import LayerLevel, BoundingBox
 
 SYNTH = "/Users/hilbert/work/editbanana-real-test/images/synth_flow.png"
 SINGLE = "/Users/hilbert/work/editbanana-round2/generated/single-chain.png"
@@ -282,6 +285,89 @@ class TestElbowConnectors(unittest.TestCase):
         self.assertEqual(len(el["waypoints"]), 4)
         self.assertEqual(el["from_box"], [50, 50, 150, 150])
         self.assertEqual(el["to_box"], [350, 250, 450, 350])
+
+class TestPortAndEdgeLabel(unittest.TestCase):
+    def test_drawio_port_source_target_binding(self):
+        ex = DetectionContourExtractor(fastsam_model_path="")
+        class Ctx:
+            def __init__(self):
+                self.image_path = SYNTH
+                self.elements = []
+                self.canvas_width = 0
+                self.canvas_height = 0
+                self.intermediate_results = {}
+        ctx = Ctx()
+        ex.process(ctx)
+        arrows = [e for e in ctx.elements if e.element_type == "arrow"]
+        self.assertGreaterEqual(len(arrows), 2)
+        for a in arrows:
+            self.assertIsNotNone(a.source_id)
+            self.assertIsNotNone(a.target_id)
+            self.assertNotEqual(a.source_id, a.target_id)
+
+    def test_bind_edge_label_to_arrow_straight_and_elbow(self):
+        # Straight arrow: (100, 200) -> (500, 200), text at (300, 180)
+        res_straight = bind_edge_label_to_arrow([280, 170, 320, 190], (100, 200), (500, 200))
+        self.assertIsNotNone(res_straight)
+        self.assertEqual(res_straight, (0, -20))
+
+        # Elbow arrow: (100, 100) -> (300, 100) -> (300, 300), text at (315, 200)
+        res_elbow = bind_edge_label_to_arrow([305, 190, 325, 210], (100, 100), (300, 300),
+                                            vector_points=[[300, 100]])
+        self.assertIsNotNone(res_elbow)
+        self.assertEqual(res_elbow, (15, 100))
+
+        # Far away text: not bound
+        res_far = bind_edge_label_to_arrow([50, 50, 80, 70], (100, 200), (500, 200))
+        self.assertIsNone(res_far)
+
+    def test_xml_merger_bind_text_to_edges(self):
+        merger = XMLMerger()
+        edge_xml = '<mxCell id="4" parent="1" edge="1"><mxGeometry relative="1" as="geometry"><mxPoint x="100" y="200" as="sourcePoint"/><mxPoint x="500" y="200" as="targetPoint"/></mxGeometry></mxCell>'
+        text_xml = '<mxCell id="text_1" value="Yes" parent="1" vertex="1"><mxGeometry x="280" y="180" width="40" height="20" as="geometry"/></mxCell>'
+        frags = [
+            XMLFragment(element_id="4", xml_content=edge_xml, layer_level=LayerLevel.ARROW.value, bbox=BoundingBox(100, 180, 500, 220), element_type="arrow"),
+            XMLFragment(element_id="text_1", xml_content=text_xml, layer_level=LayerLevel.TEXT.value, bbox=BoundingBox(280, 180, 320, 200), element_type="text"),
+        ]
+        updated = merger.bind_text_to_edges(frags, max_dist=60.0)
+        text_frag = [f for f in updated if f.element_id == "text_1"][0]
+        self.assertEqual(text_frag.element_type, "edge_label")
+        self.assertIn('parent="4"', text_frag.xml_content)
+        self.assertIn('connectable="0"', text_frag.xml_content)
+        self.assertIn('as="offset"', text_frag.xml_content)
+
+
+class TestW2DetectionGaps(unittest.TestCase):
+    def test_w2_cases_no_reversed_and_z_detected(self):
+        cases_dir = "/Users/hilbert/work/editbanana-fastsam-integration/cases"
+        if not os.path.exists(os.path.join(cases_dir, "manifest.json")):
+            self.skipTest("w2 cases not present")
+        import cv2
+        import json
+        # 1. arrow_left: must be from right box to left box
+        img_left = cv2.imread(os.path.join(cases_dir, "arrow_left.png"))
+        boxes_left = detect_shape_boxes(img_left)
+        arrows_left = detect_arrow_shafts(img_left, boxes_left)
+        self.assertEqual(len(arrows_left), 1)
+        self.assertLess(arrows_left[0]["to_box"][0], 200)
+        self.assertGreater(arrows_left[0]["from_box"][0], 500)
+
+        # 2. elbow_up: must be from bottom-left box to top-right box
+        img_up = cv2.imread(os.path.join(cases_dir, "elbow_up.png"))
+        boxes_up = detect_shape_boxes(img_up)
+        arrows_up = detect_arrow_shafts(img_up, boxes_up)
+        self.assertEqual(len(arrows_up), 1)
+        self.assertEqual(arrows_up[0]["connector_type"], "elbow")
+        self.assertLess(arrows_up[0]["to_box"][1], 200)
+        self.assertGreater(arrows_up[0]["from_box"][1], 500)
+
+        # 3. elbow_Z_right: must be detected with bends = 2
+        img_z = cv2.imread(os.path.join(cases_dir, "elbow_Z_right.png"))
+        boxes_z = detect_shape_boxes(img_z)
+        arrows_z = detect_arrow_shafts(img_z, boxes_z)
+        self.assertEqual(len(arrows_z), 1)
+        self.assertEqual(arrows_z[0]["connector_type"], "elbow")
+        self.assertEqual(arrows_z[0]["bends"], 2)
 
 
 if __name__ == "__main__":

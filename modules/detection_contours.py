@@ -111,6 +111,51 @@ def _dist_to_box(bx: List[int], x: float, y: float) -> float:
     return math.hypot(dx, dy)
 
 
+def bind_edge_label_to_arrow(text_bbox: List[int], arrow_start: Tuple[int, int],
+                             arrow_end: Tuple[int, int],
+                             vector_points: Optional[List[List[int]]] = None,
+                             max_dist: float = 60.0) -> Optional[Tuple[int, int]]:
+    """Calculate offset (offset_x, offset_y) from edge midpoint if text is near the arrow.
+
+    Returns (offset_x, offset_y) if projected distance from text center to edge is <= max_dist,
+    else None.
+    """
+    tcx = (text_bbox[0] + text_bbox[2]) / 2.0
+    tcy = (text_bbox[1] + text_bbox[3]) / 2.0
+
+    pts = [arrow_start] + (vector_points or []) + [arrow_end]
+    seg_lens = [math.hypot(pts[i+1][0] - pts[i][0], pts[i+1][1] - pts[i][1]) for i in range(len(pts) - 1)]
+    total_len = sum(seg_lens)
+    if total_len <= 0:
+        mid_x, mid_y = arrow_start
+    else:
+        half_len = total_len / 2.0
+        acc = 0.0
+        mid_x, mid_y = pts[-1]
+        for i, slen in enumerate(seg_lens):
+            if acc + slen >= half_len:
+                t = (half_len - acc) / max(1e-6, slen)
+                mid_x = pts[i][0] + t * (pts[i+1][0] - pts[i][0])
+                mid_y = pts[i][1] + t * (pts[i+1][1] - pts[i][1])
+                break
+            acc += slen
+
+    min_dist = 1e9
+    for i in range(len(pts) - 1):
+        x1, y1 = pts[i]
+        x2, y2 = pts[i+1]
+        dx, dy = x2 - x1, y2 - y1
+        if dx == 0 and dy == 0:
+            d = math.hypot(tcx - x1, tcy - y1)
+        else:
+            t = max(0.0, min(1.0, ((tcx - x1) * dx + (tcy - y1) * dy) / (dx * dx + dy * dy)))
+            d = math.hypot(tcx - (x1 + t * dx), tcy - (y1 + t * dy))
+        if d < min_dist:
+            min_dist = d
+
+    if min_dist <= max_dist:
+        return int(round(tcx - mid_x)), int(round(tcy - mid_y))
+    return None
 def detect_elbow_connectors(lines: List[Any], boxes: List[Dict[str, Any]],
                             image_bgr: Optional[np.ndarray] = None,
                             heads: Optional[List[List[int]]] = None,
@@ -132,59 +177,56 @@ def detect_elbow_connectors(lines: List[Any], boxes: List[Dict[str, Any]],
             vert.append((int((x1 + x2) / 2), min(y1, y2), int((x1 + x2) / 2), max(y1, y2)))
 
     elbows = []
-    seen_pairs = set()
+    connected_pairs = set()
+    head_pts = [((h[0] + h[2]) / 2, (h[1] + h[3]) / 2) for h in (heads or [])]
 
     for a in boxes:
         for b in boxes:
             if a is b:
-                continue
-            pair_key = (min(tuple(a["bbox"]), tuple(b["bbox"])), max(tuple(a["bbox"]), tuple(b["bbox"])))
-            if pair_key in seen_pairs:
                 continue
 
             # 1. L-shaped: H meets V near corner (vx, hy)
             found = False
             for hx1, hy, hx2, _ in horiz:
                 for vx, vy1, _, vy2 in vert:
-                    corner_x = min(abs(hx1 - vx), abs(hx2 - vx))
-                    corner_y = min(abs(vy1 - hy), abs(vy2 - hy))
-                    if corner_x <= 25 and corner_y <= 25:
+                    if min(abs(hx1 - vx), abs(hx2 - vx)) <= 25 and min(abs(vy1 - hy), abs(vy2 - hy)) <= 25:
                         h_far_x = hx1 if abs(hx2 - vx) < abs(hx1 - vx) else hx2
                         v_far_y = vy1 if abs(vy2 - hy) < abs(vy1 - hy) else vy2
-                        # Direction: A -> H -> Corner -> V -> B
-                        if _dist_to_box(a["bbox"], h_far_x, hy) <= slack and _dist_to_box(b["bbox"], vx, v_far_y) <= slack:
-                            head = any(
-                                _dist_to_box(b["bbox"], hx + hw / 2, hy + hh / 2) < 40
-                                for hx, hy, hw, hh in (heads or [])
-                            )
+                        p_h = (h_far_x, hy)
+                        p_v = (vx, v_far_y)
+
+                        if _dist_to_box(a["bbox"], p_h[0], p_h[1]) <= slack and _dist_to_box(b["bbox"], p_v[0], p_v[1]) <= slack:
+                            box_h, box_v = a, b
+                        elif _dist_to_box(b["bbox"], p_h[0], p_h[1]) <= slack and _dist_to_box(a["bbox"], p_v[0], p_v[1]) <= slack:
+                            box_h, box_v = b, a
+                        else:
+                            continue
+
+                        head_at_h = any(_dist_to_box(box_h["bbox"], hx, hy_pt) <= 40 and math.hypot(p_h[0] - hx, p_h[1] - hy_pt) <= 50 for hx, hy_pt in head_pts)
+                        head_at_v = any(_dist_to_box(box_v["bbox"], hx, hy_pt) <= 40 and math.hypot(p_v[0] - hx, p_v[1] - hy_pt) <= 50 for hx, hy_pt in head_pts)
+
+                        if head_at_h and not head_at_v:
+                            from_b, to_b = box_v["bbox"], box_h["bbox"]
+                            wpts = [[int(p_v[0]), int(p_v[1])], [int(vx), int(hy)], [int(p_h[0]), int(p_h[1])]]
+                            head = True
+                        else:
+                            from_b, to_b = box_h["bbox"], box_v["bbox"]
+                            wpts = [[int(p_h[0]), int(p_h[1])], [int(vx), int(hy)], [int(p_v[0]), int(p_v[1])]]
+                            head = head_at_v
+
+                        pair = (from_b[0], from_b[1], to_b[0], to_b[1])
+                        rev_pair = (to_b[0], to_b[1], from_b[0], from_b[1])
+                        if pair not in connected_pairs and rev_pair not in connected_pairs:
                             elbows.append({
-                                "from_box": a["bbox"], "to_box": b["bbox"],
+                                "from_box": from_b, "to_box": to_b,
                                 "connector_type": "elbow",
-                                "waypoints": [[int(h_far_x), int(hy)], [int(vx), int(hy)], [int(vx), int(v_far_y)]],
+                                "waypoints": wpts,
                                 "bends": 1,
                                 "shaft_confirmed": True,
                                 "head_separated": bool(head),
                                 "method": "elbow_orthogonal_chain",
                             })
-                            seen_pairs.add(pair_key)
-                            found = True
-                            break
-                        # Direction: A -> V -> Corner -> H -> B
-                        elif _dist_to_box(a["bbox"], vx, v_far_y) <= slack and _dist_to_box(b["bbox"], h_far_x, hy) <= slack:
-                            head = any(
-                                _dist_to_box(b["bbox"], hx + hw / 2, hy + hh / 2) < 40
-                                for hx, hy, hw, hh in (heads or [])
-                            )
-                            elbows.append({
-                                "from_box": a["bbox"], "to_box": b["bbox"],
-                                "connector_type": "elbow",
-                                "waypoints": [[int(vx), int(v_far_y)], [int(vx), int(hy)], [int(h_far_x), int(hy)]],
-                                "bends": 1,
-                                "shaft_confirmed": True,
-                                "head_separated": bool(head),
-                                "method": "elbow_orthogonal_chain",
-                            })
-                            seen_pairs.add(pair_key)
+                            connected_pairs.add(pair)
                             found = True
                             break
                 if found:
@@ -195,35 +237,48 @@ def detect_elbow_connectors(lines: List[Any], boxes: List[Dict[str, Any]],
             # 2. Z-shaped: H1 -> V -> H2
             for h1x1, h1y, h1x2, _ in horiz:
                 for vx, vy1, _, vy2 in vert:
-                    c1_x = min(abs(h1x1 - vx), abs(h1x2 - vx))
-                    c1_y = min(abs(vy1 - h1y), abs(vy2 - h1y))
-                    if c1_x <= 25 and c1_y <= 25:
+                    if min(abs(h1x1 - vx), abs(h1x2 - vx)) <= 25 and min(abs(vy1 - h1y), abs(vy2 - h1y)) <= 25:
                         h1_far_x = h1x1 if abs(h1x2 - vx) < abs(h1x1 - vx) else h1x2
                         v_far_y = vy1 if abs(vy2 - h1y) < abs(vy1 - h1y) else vy2
                         for h2x1, h2y, h2x2, _ in horiz:
                             if h2y == h1y and h2x1 == h1x1:
                                 continue
-                            c2_x = min(abs(h2x1 - vx), abs(h2x2 - vx))
-                            c2_y = abs(h2y - v_far_y)
-                            if c2_x <= 25 and c2_y <= 25:
+                            if min(abs(h2x1 - vx), abs(h2x2 - vx)) <= 25 and abs(h2y - v_far_y) <= 25:
                                 h2_far_x = h2x1 if abs(h2x2 - vx) < abs(h2x1 - vx) else h2x2
-                                if (_dist_to_box(a["bbox"], h1_far_x, h1y) <= slack
-                                        and _dist_to_box(b["bbox"], h2_far_x, h2y) <= slack):
-                                    head = any(
-                                        _dist_to_box(b["bbox"], hx + hw / 2, hy + hh / 2) < 40
-                                        for hx, hy, hw, hh in (heads or [])
-                                    )
+                                p1 = (h1_far_x, h1y)
+                                p2 = (h2_far_x, h2y)
+                                if _dist_to_box(a["bbox"], p1[0], p1[1]) <= slack and _dist_to_box(b["bbox"], p2[0], p2[1]) <= slack:
+                                    box1, box2 = a, b
+                                elif _dist_to_box(b["bbox"], p1[0], p1[1]) <= slack and _dist_to_box(a["bbox"], p2[0], p2[1]) <= slack:
+                                    box1, box2 = b, a
+                                else:
+                                    continue
+
+                                head_at_p1 = any(_dist_to_box(box1["bbox"], hx, hy_pt) <= 40 for hx, hy_pt in head_pts)
+                                head_at_p2 = any(_dist_to_box(box2["bbox"], hx, hy_pt) <= 40 for hx, hy_pt in head_pts)
+
+                                if head_at_p1 and not head_at_p2:
+                                    from_b, to_b = box2["bbox"], box1["bbox"]
+                                    wpts = [[int(p2[0]), int(p2[1])], [int(vx), int(h2y)], [int(vx), int(h1y)], [int(p1[0]), int(p1[1])]]
+                                    head = True
+                                else:
+                                    from_b, to_b = box1["bbox"], box2["bbox"]
+                                    wpts = [[int(p1[0]), int(p1[1])], [int(vx), int(h1y)], [int(vx), int(h2y)], [int(p2[0]), int(p2[1])]]
+                                    head = head_at_p2
+
+                                pair = (from_b[0], from_b[1], to_b[0], to_b[1])
+                                rev_pair = (to_b[0], to_b[1], from_b[0], from_b[1])
+                                if pair not in connected_pairs and rev_pair not in connected_pairs:
                                     elbows.append({
-                                        "from_box": a["bbox"], "to_box": b["bbox"],
+                                        "from_box": from_b, "to_box": to_b,
                                         "connector_type": "elbow",
-                                        "waypoints": [[int(h1_far_x), int(h1y)], [int(vx), int(h1y)],
-                                                      [int(vx), int(h2y)], [int(h2_far_x), int(h2y)]],
+                                        "waypoints": wpts,
                                         "bends": 2,
                                         "shaft_confirmed": True,
                                         "head_separated": bool(head),
                                         "method": "elbow_orthogonal_chain",
                                     })
-                                    seen_pairs.add(pair_key)
+                                    connected_pairs.add(pair)
                                     found = True
                                     break
                         if found:
@@ -241,105 +296,153 @@ def detect_arrow_shafts(image_bgr: np.ndarray, boxes: List[Dict[str, Any]]) -> L
     """
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 50, 150)
-    hl = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80,
-                         minLineLength=60, maxLineGap=50)
+    hl = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=45,
+                         minLineLength=35, maxLineGap=50)
     lines = []
     if hl is not None:
         for x1, y1, x2, y2 in hl.reshape(-1, 4):
-            if math.hypot(x2 - x1, y2 - y1) >= 60:
+            if math.hypot(x2 - x1, y2 - y1) >= 35:
                 lines.append((int(x1), int(y1), int(x2), int(y2)))
-    # Square-like triangle heads (v2 filter from round 2)
+    # Triangle/wedge arrowhead detection
     _, th = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
     cnts, _ = cv2.findContours(th, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     heads = []
     for cnt in cnts:
         area = cv2.contourArea(cnt)
-        if area < 80 or area > 5000:
-            continue
-        approx = cv2.approxPolyDP(cnt, 0.02 * cv2.arcLength(cnt, True), True)
-        if len(approx) != 3:
+        if area < 50 or area > 5000:
             continue
         x, y, w, h = cv2.boundingRect(cnt)
-        if w > 60 or h > 60 or not (0.5 <= w / max(1, h) <= 2.0):
+        if w > 60 or h > 60 or not (0.4 <= w / max(1, h) <= 2.5):
             continue
-        heads.append([int(x), int(y), int(w), int(h)])
+        # Exclude glyphs inside shape boxes
+        cx, cy = x + w / 2, y + h / 2
+        if boxes and any(b["bbox"][0] <= cx <= b["bbox"][2] and b["bbox"][1] <= cy <= b["bbox"][3] for b in boxes):
+            continue
+        fill_ratio = area / max(1.0, w * h)
+        if 0.25 <= fill_ratio <= 0.85:
+            heads.append([int(x), int(y), int(x + w), int(y + h)])
 
-
-
+    head_pts = [((h[0] + h[2]) / 2, (h[1] + h[3]) / 2) for h in heads]
     arrows = []
+    connected_pairs = set()
+
     for a in boxes:
         for b in boxes:
             if a is b:
                 continue
             ax1, ay1, ax2, ay2 = a["bbox"]
             bx1, by1, bx2, by2 = b["bbox"]
-            # 1. Horizontal arrow (same row, a left of b, with a gap)
-            if abs((ay1 + ay2) / 2 - (by1 + by2) / 2) <= 30 and ax2 < bx1:
-                gap = bx1 - ax2
-                if gap < 10:
-                    continue
-                cy = (ay1 + ay2) / 2
-                slack = max(40, int(gap * 0.35))
-                shaft = any(
-                    abs(y1 - cy) < 25 and abs(y2 - cy) < 25
-                    and min(x1, x2) <= ax2 + slack and max(x1, x2) >= bx1 - slack
-                    for x1, y1, x2, y2 in lines
-                )
-                if shaft:
-                    head = any(
-                        abs(hx + hw / 2 - bx1) < 40 and abs(hy + hh / 2 - cy) < 40
-                        for hx, hy, hw, hh in heads
-                    )
-                    arrows.append({
-                        "from_box": a["bbox"], "to_box": b["bbox"],
-                        "shaft_confirmed": True, "head_separated": bool(head),
-                        "method": "hough_shaft_between_boxes",
-                    })
-                    continue
 
-            # 2. Diagonal / connecting arrow (a above b with gap, non-overlapping)
-            if ay2 <= by1 + 10:
-                gap = math.hypot(max(0, ax1 - bx2, bx1 - ax2), max(0, ay1 - by2, by1 - ay2))
-                if gap < 30:
-                    continue
-                cax, cay = (ax1 + ax2) / 2, (ay1 + ay2) / 2
-                cbx, cby = (bx1 + bx2) / 2, (by1 + by2) / 2
-                box_ang = math.atan2(cby - cay, cbx - cax)
-                for x1, y1, x2, y2 in lines:
-                    d1a = _dist_to_box(a["bbox"], x1, y1)
-                    d2b = _dist_to_box(b["bbox"], x2, y2)
-                    d2a = _dist_to_box(a["bbox"], x2, y2)
-                    d1b = _dist_to_box(b["bbox"], x1, y1)
-                    match = False
-                    if d1a <= 40 and d2b <= 40:
-                        line_ang = math.atan2(y2 - y1, x2 - x1)
-                        match = True
-                    elif d2a <= 40 and d1b <= 40:
-                        line_ang = math.atan2(y1 - y2, x1 - x2)
-                        match = True
-                    if match:
-                        diff = abs(line_ang - box_ang)
-                        diff = min(diff, 2 * math.pi - diff)
-                        if diff < math.radians(20):
-                            head = any(
-                                _dist_to_box(b["bbox"], hx + hw / 2, hy + hh / 2) < 40
-                                for hx, hy, hw, hh in heads
-                            )
+            # 1. Horizontal straight arrow (same row)
+            if abs((ay1 + ay2) / 2 - (by1 + by2) / 2) <= 30 and (ax2 < bx1 or bx2 < ax1):
+                left_box = a if ax2 < bx1 else b
+                right_box = b if ax2 < bx1 else a
+                lx2 = left_box["bbox"][2]
+                rx1 = right_box["bbox"][0]
+                gap = rx1 - lx2
+                if gap >= 10:
+                    cy = (ay1 + ay2) / 2
+                    slack = max(40, int(gap * 0.35))
+                    shaft = any(
+                        abs(y1 - cy) < 25 and abs(y2 - cy) < 25
+                        and min(x1, x2) <= lx2 + slack and max(x1, x2) >= rx1 - slack
+                        for x1, y1, x2, y2 in lines
+                    )
+                    if shaft:
+                        head_at_left = any(_dist_to_box(left_box["bbox"], hx, hy) <= 40 for hx, hy in head_pts)
+                        head_at_right = any(_dist_to_box(right_box["bbox"], hx, hy) <= 40 for hx, hy in head_pts)
+                        if head_at_left and not head_at_right:
+                            from_b, to_b = right_box["bbox"], left_box["bbox"]
+                            head = True
+                        else:
+                            from_b, to_b = left_box["bbox"], right_box["bbox"]
+                            head = head_at_right
+                        pair = (from_b[0], from_b[1], to_b[0], to_b[1])
+                        if pair not in connected_pairs:
                             arrows.append({
-                                "from_box": a["bbox"], "to_box": b["bbox"],
+                                "from_box": from_b, "to_box": to_b,
                                 "shaft_confirmed": True, "head_separated": bool(head),
                                 "method": "hough_shaft_between_boxes",
                             })
-                            break
+                            connected_pairs.add(pair)
+                            continue
 
-    # 3. Multi-directional elbow connectors (L-shaped and Z-shaped)
-    straight_pairs = {(a["from_box"][0], a["from_box"][1], a["to_box"][0], a["to_box"][1]) for a in arrows}
+            # 2. Vertical straight arrow (same column)
+            if abs((ax1 + ax2) / 2 - (bx1 + bx2) / 2) <= 30 and (ay2 < by1 or by2 < ay1):
+                top_box = a if ay2 < by1 else b
+                bot_box = b if ay2 < by1 else a
+                ty2 = top_box["bbox"][3]
+                by1_c = bot_box["bbox"][1]
+                gap = by1_c - ty2
+                if gap >= 10:
+                    cx = (ax1 + ax2) / 2
+                    slack = max(40, int(gap * 0.35))
+                    shaft = any(
+                        abs(x1 - cx) < 25 and abs(x2 - cx) < 25
+                        and min(y1, y2) <= ty2 + slack and max(y1, y2) >= by1_c - slack
+                        for x1, y1, x2, y2 in lines
+                    )
+                    if shaft:
+                        head_at_top = any(_dist_to_box(top_box["bbox"], hx, hy) <= 40 for hx, hy in head_pts)
+                        head_at_bot = any(_dist_to_box(bot_box["bbox"], hx, hy) <= 40 for hx, hy in head_pts)
+                        if head_at_top and not head_at_bot:
+                            from_b, to_b = bot_box["bbox"], top_box["bbox"]
+                            head = True
+                        else:
+                            from_b, to_b = top_box["bbox"], bot_box["bbox"]
+                            head = head_at_bot
+                        pair = (from_b[0], from_b[1], to_b[0], to_b[1])
+                        if pair not in connected_pairs:
+                            arrows.append({
+                                "from_box": from_b, "to_box": to_b,
+                                "shaft_confirmed": True, "head_separated": bool(head),
+                                "method": "hough_shaft_between_boxes",
+                            })
+                            connected_pairs.add(pair)
+                            continue
+
+            # 3. Diagonal straight arrow (a above b with gap, non-overlapping)
+            if ay2 <= by1 + 10:
+                gap = math.hypot(max(0, ax1 - bx2, bx1 - ax2), max(0, ay1 - by2, by1 - ay2))
+                if gap >= 30:
+                    cax, cay = (ax1 + ax2) / 2, (ay1 + ay2) / 2
+                    cbx, cby = (bx1 + bx2) / 2, (by1 + by2) / 2
+                    box_ang = math.atan2(cby - cay, cbx - cax)
+                    for x1, y1, x2, y2 in lines:
+                        d1a = _dist_to_box(a["bbox"], x1, y1)
+                        d2b = _dist_to_box(b["bbox"], x2, y2)
+                        d2a = _dist_to_box(a["bbox"], x2, y2)
+                        d1b = _dist_to_box(b["bbox"], x1, y1)
+                        match = False
+                        if d1a <= 40 and d2b <= 40:
+                            line_ang = math.atan2(y2 - y1, x2 - x1)
+                            match = True
+                        elif d2a <= 40 and d1b <= 40:
+                            line_ang = math.atan2(y1 - y2, x1 - x2)
+                            match = True
+                        if match:
+                            diff = abs(line_ang - box_ang)
+                            diff = min(diff, 2 * math.pi - diff)
+                            if diff < math.radians(20):
+                                head_at_b = any(_dist_to_box(b["bbox"], hx, hy) <= 40 for hx, hy in head_pts)
+                                pair = (a["bbox"][0], a["bbox"][1], b["bbox"][0], b["bbox"][1])
+                                if pair not in connected_pairs:
+                                    arrows.append({
+                                        "from_box": a["bbox"], "to_box": b["bbox"],
+                                        "shaft_confirmed": True, "head_separated": bool(head_at_b),
+                                        "method": "hough_shaft_between_boxes",
+                                    })
+                                    connected_pairs.add(pair)
+                                    break
+
+    # 4. Multi-directional elbow connectors (L-shaped and Z-shaped)
     elbows = detect_elbow_connectors(lines, boxes, image_bgr=image_bgr, heads=heads, slack=40)
     for el in elbows:
         pair = (el["from_box"][0], el["from_box"][1], el["to_box"][0], el["to_box"][1])
-        if pair not in straight_pairs:
+        rev_pair = (el["to_box"][0], el["to_box"][1], el["from_box"][0], el["from_box"][1])
+        if pair not in connected_pairs and rev_pair not in connected_pairs:
             arrows.append(el)
-            straight_pairs.add(pair)
+            connected_pairs.add(pair)
     return arrows
 
 
@@ -480,6 +583,13 @@ class DetectionContourExtractor:
                 poly = []
                 vector_points = []
             x1, y1, x2, y2 = abox
+            source_id = None
+            target_id = None
+            for s_idx, sb in enumerate(result["shapes"]):
+                if sb["bbox"] == a["from_box"]:
+                    source_id = str(s_idx)
+                if sb["bbox"] == a["to_box"]:
+                    target_id = str(s_idx)
             elements.append(ElementInfo(
                 id=len(elements), element_type="arrow",
                 bbox=BoundingBox(x1=x1, y1=y1, x2=x2, y2=y2),
@@ -488,6 +598,8 @@ class DetectionContourExtractor:
                 arrow_start=arrow_start,
                 arrow_end=arrow_end,
                 vector_points=vector_points,
+                source_id=source_id,
+                target_id=target_id,
             ))
         # FastSAM arrow instances: a mask that spans the same gap
         # as a shaft-confirmed arrow CONFIRMS that arrow as an

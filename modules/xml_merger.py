@@ -35,11 +35,12 @@
     result = merger.process(context)
 """
 
+import math
 import os
 import re
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
 from pathlib import Path
 
 from .base import BaseProcessor, ProcessingContext
@@ -218,7 +219,10 @@ class XMLMerger(BaseProcessor):
                 text_fragments = self._extract_text_fragments_from_xml(text_xml)
                 fragments.extend(text_fragments)
                 self._log(f"从文字XML中提取了 {len(text_fragments)} 个文字片段")
-        
+
+        # 自动将邻近连线的独立文字绑定为 DrawIO edgeLabel
+        fragments = self.bind_text_to_edges(fragments)
+
         return fragments
     
     def _scale_xml_coordinates(self, xml_content: str, scale: float) -> str:
@@ -334,7 +338,114 @@ class XMLMerger(BaseProcessor):
             self._log(f"提取文字片段失败: {e}")
         
         return fragments
-    
+
+    def bind_text_to_edges(self, fragments: List[XMLFragment], max_dist: float = 60.0) -> List[XMLFragment]:
+        """Auto-position standalone text fragments as DrawIO edgeLabels for nearby arrows/connectors."""
+        def point_to_segment(px, py, x1, y1, x2, y2):
+            dx, dy = x2 - x1, y2 - y1
+            if dx == 0 and dy == 0:
+                return math.hypot(px - x1, py - y1)
+            t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)))
+            proj_x = x1 + t * dx
+            proj_y = y1 + t * dy
+            return math.hypot(px - proj_x, py - proj_y)
+
+        # 1. Collect edges and shape boxes
+        edges = []
+        shape_boxes = []
+        for f in fragments:
+            if 'edge="1"' in f.xml_content:
+                try:
+                    cell = ET.fromstring(f.xml_content)
+                    edge_id = cell.get('id', '')
+                    geom = cell.find('mxGeometry')
+                    if geom is not None:
+                        sp = geom.find('mxPoint[@as="sourcePoint"]')
+                        tp = geom.find('mxPoint[@as="targetPoint"]')
+                        if sp is not None and tp is not None:
+                            sx, sy = float(sp.get('x', 0)), float(sp.get('y', 0))
+                            tx, ty = float(tp.get('x', 0)), float(tp.get('y', 0))
+                            pts = [(sx, sy)]
+                            arr = geom.find('Array')
+                            if arr is not None:
+                                for mp in arr.iter('mxPoint'):
+                                    pts.append((float(mp.get('x', 0)), float(mp.get('y', 0))))
+                            pts.append((tx, ty))
+                            # Calculate midpoint along path
+                            seg_lens = [math.hypot(pts[i+1][0]-pts[i][0], pts[i+1][1]-pts[i][1]) for i in range(len(pts)-1)]
+                            total_l = sum(seg_lens)
+                            half_l = total_l / 2.0
+                            acc = 0.0
+                            mid_x, mid_y = pts[-1]
+                            for i, slen in enumerate(seg_lens):
+                                if acc + slen >= half_l:
+                                    t_ratio = (half_l - acc) / max(1e-6, slen)
+                                    mid_x = pts[i][0] + t_ratio * (pts[i+1][0] - pts[i][0])
+                                    mid_y = pts[i][1] + t_ratio * (pts[i+1][1] - pts[i][1])
+                                    break
+                                acc += slen
+                            edges.append({
+                                'edge_id': edge_id,
+                                'pts': pts,
+                                'mid': (mid_x, mid_y),
+                            })
+                except Exception:
+                    pass
+            elif f.layer_level == LayerLevel.BASIC_SHAPE.value and f.bbox:
+                shape_boxes.append(f.bbox)
+
+        if not edges:
+            return fragments
+
+        # 2. Check each text fragment
+        updated = []
+        for f in fragments:
+            if f.element_type == "text" and f.bbox and 'connectable="0"' not in f.xml_content:
+                tcx = (f.bbox.x1 + f.bbox.x2) / 2.0
+                tcy = (f.bbox.y1 + f.bbox.y2) / 2.0
+                # Check if inside any shape box
+                in_shape = any(sb.x1 <= tcx <= sb.x2 and sb.y1 <= tcy <= sb.y2 for sb in shape_boxes)
+                if not in_shape:
+                    best_edge = None
+                    best_dist = 1e9
+                    for e in edges:
+                        pts = e['pts']
+                        d = min(point_to_segment(tcx, tcy, pts[i][0], pts[i][1], pts[i+1][0], pts[i+1][1]) for i in range(len(pts)-1))
+                        if d < best_dist:
+                            best_dist = d
+                            best_edge = e
+
+                    if best_edge and best_dist <= max_dist:
+                        ox = int(round(tcx - best_edge['mid'][0]))
+                        oy = int(round(tcy - best_edge['mid'][1]))
+                        try:
+                            cell = ET.fromstring(f.xml_content)
+                            cell.set('parent', best_edge['edge_id'])
+                            cell.set('connectable', '0')
+                            cell.set('vertex', '1')
+                            cell.set('style', 'edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];')
+                            geom = cell.find('mxGeometry')
+                            if geom is None:
+                                geom = ET.SubElement(cell, 'mxGeometry')
+                            geom.attrib.clear()
+                            geom.set('relative', '1')
+                            geom.set('as', 'geometry')
+                            off = ET.SubElement(geom, 'mxPoint')
+                            off.set('x', str(ox))
+                            off.set('y', str(oy))
+                            off.set('as', 'offset')
+                            new_xml = ET.tostring(cell, encoding='unicode')
+                            f = XMLFragment(
+                                element_id=f.element_id,
+                                xml_content=new_xml,
+                                layer_level=LayerLevel.TEXT.value,
+                                bbox=f.bbox,
+                                element_type="edge_label"
+                            )
+                        except Exception:
+                            pass
+            updated.append(f)
+        return updated
     def _sort_fragments(self, fragments: List[XMLFragment]) -> List[XMLFragment]:
         """
         排序XML片段
