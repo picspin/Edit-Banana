@@ -15,10 +15,16 @@ from modules.fastsam_detection import (
     classify_arrow_instances,
     classify_shape_candidates,
     detect_fastsam_masks,
+    estimate_arrowhead_orientation,
     iou_xyxy,
     merge_fastsam,
 )
-from modules.detection_contours import DetectionContourExtractor
+from modules.detection_contours import (
+    DetectionContourExtractor,
+    detect_arrow_shafts,
+    detect_elbow_connectors,
+    detect_shape_boxes,
+)
 
 SYNTH = "/Users/hilbert/work/editbanana-real-test/images/synth_flow.png"
 SINGLE = "/Users/hilbert/work/editbanana-round2/generated/single-chain.png"
@@ -147,7 +153,10 @@ class TestFastsamLive(unittest.TestCase):
             for g, w in zip(got_box, want):
                 self.assertLessEqual(abs(g - w), 10)
         self.assertTrue(all(a["head_separated"] for a in arrows))
-
+        # Direction certainty: synth arrows point horizontally to the right
+        self.assertTrue(all(a.get("orientation_deg") is not None for a in arrows))
+        self.assertTrue(all(abs(a["orientation_deg"]) < 15.0 for a in arrows))
+        self.assertTrue(all(a["polarity_vec"][0] > 0.9 for a in arrows))
     def test_single_chain_arrow_instances_detected(self):
         import cv2
         img = cv2.imread(SINGLE)
@@ -159,7 +168,15 @@ class TestFastsamLive(unittest.TestCase):
         arrows = classify_arrow_instances(masks, shapes, shafts=shafts)
         self.assertEqual(len(arrows), 3)
         self.assertTrue(all(a["head_separated"] for a in arrows))
-
+        # All 3 arrows have estimated orientation and apex tip
+        self.assertTrue(all(a.get("orientation_deg") is not None for a in arrows))
+        self.assertTrue(all(a.get("tip_pt") is not None for a in arrows))
+        # Horizontal arrows (idx 0 and 2) point right (+x)
+        self.assertGreater(arrows[0]["polarity_vec"][0], 0.9)
+        self.assertGreater(arrows[2]["polarity_vec"][0], 0.9)
+        # Diagonal arrow (idx 1) points down-left (negative x, positive y)
+        self.assertLess(arrows[1]["polarity_vec"][0], -0.5)
+        self.assertGreater(arrows[1]["polarity_vec"][1], 0.3)
 class TestFastsamProcessDedup(unittest.TestCase):
     @unittest.skipUnless(fastsam_available(),
                          "FastSAM torch/weights unavailable")
@@ -207,6 +224,65 @@ class TestFastsamProcessDedup(unittest.TestCase):
             res.metadata["fastsam_arrow_instances_matched_shaft"], 3)
         self.assertEqual(res.metadata["fastsam_arrow_instances_new"], 0)
         self.assertEqual(res.metadata["arrows_head_separated"], 3)
+
+
+class TestArrowheadOrientation(unittest.TestCase):
+    def test_cardinal_directions(self):
+        import numpy as np
+        # Right (+x, 0 deg)
+        c_right = np.array([[10, 10], [10, 30], [35, 20]], dtype=np.int32)
+        r_right = estimate_arrowhead_orientation(c_right)
+        self.assertAlmostEqual(r_right["orientation_deg"], 0.0, places=0)
+        self.assertEqual(r_right["tip_pt"], [35, 20])
+        self.assertGreater(r_right["polarity_vec"][0], 0.9)
+
+        # Down (+y, 90 deg)
+        c_down = np.array([[10, 10], [30, 10], [20, 35]], dtype=np.int32)
+        r_down = estimate_arrowhead_orientation(c_down)
+        self.assertAlmostEqual(r_down["orientation_deg"], 90.0, places=0)
+        self.assertEqual(r_down["tip_pt"], [20, 35])
+        self.assertGreater(r_down["polarity_vec"][1], 0.9)
+
+        # Left (-x, 180 deg)
+        c_left = np.array([[35, 10], [35, 30], [10, 20]], dtype=np.int32)
+        r_left = estimate_arrowhead_orientation(c_left)
+        self.assertAlmostEqual(abs(r_left["orientation_deg"]), 180.0, places=0)
+        self.assertEqual(r_left["tip_pt"], [10, 20])
+        self.assertLess(r_left["polarity_vec"][0], -0.9)
+
+        # Up (-y, -90 deg)
+        c_up = np.array([[10, 35], [30, 35], [20, 10]], dtype=np.int32)
+        r_up = estimate_arrowhead_orientation(c_up)
+        self.assertAlmostEqual(r_up["orientation_deg"], -90.0, places=0)
+        self.assertEqual(r_up["tip_pt"], [20, 10])
+        self.assertLess(r_up["polarity_vec"][1], -0.9)
+
+
+class TestElbowConnectors(unittest.TestCase):
+    def test_l_shaped_elbow_connector(self):
+        lines = [(150, 100, 350, 100), (350, 100, 350, 300)]
+        boxes = [{"bbox": [50, 50, 150, 150]}, {"bbox": [300, 300, 400, 400]}]
+        elbows = detect_elbow_connectors(lines, boxes, slack=40)
+        self.assertEqual(len(elbows), 1)
+        el = elbows[0]
+        self.assertEqual(el["connector_type"], "elbow")
+        self.assertEqual(el["bends"], 1)
+        self.assertEqual(len(el["waypoints"]), 3)
+        self.assertEqual(el["from_box"], [50, 50, 150, 150])
+        self.assertEqual(el["to_box"], [300, 300, 400, 400])
+
+    def test_z_shaped_elbow_connector(self):
+        lines = [(150, 100, 250, 100), (250, 100, 250, 300), (250, 300, 350, 300)]
+        boxes = [{"bbox": [50, 50, 150, 150]}, {"bbox": [350, 250, 450, 350]}]
+        elbows = detect_elbow_connectors(lines, boxes, slack=40)
+        self.assertEqual(len(elbows), 1)
+        el = elbows[0]
+        self.assertEqual(el["connector_type"], "elbow")
+        self.assertEqual(el["bends"], 2)
+        self.assertEqual(len(el["waypoints"]), 4)
+        self.assertEqual(el["from_box"], [50, 50, 150, 150])
+        self.assertEqual(el["to_box"], [350, 250, 450, 350])
+
 
 if __name__ == "__main__":
     unittest.main()

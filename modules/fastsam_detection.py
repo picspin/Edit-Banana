@@ -112,6 +112,10 @@ def detect_fastsam_masks(image_bgr, model_path=None, conf=0.4,
         c = max(cnts, key=cv2.contourArea)
         x, y, w, h = cv2.boundingRect(c)
         approx = cv2.approxPolyDP(c, 0.02 * cv2.arcLength(c, True), True)
+        ar = w / max(1, h)
+        orientation = None
+        if 10 <= w <= 80 and 10 <= h <= 80 and 100 <= area_work <= 2000 and 0.5 <= ar <= 2.0:
+            orientation = estimate_arrowhead_orientation(c, scale)
         dets.append({
             "bbox": [int(x / scale), int(y / scale),
                      int((x + w) / scale), int((y + h) / scale)],
@@ -119,9 +123,82 @@ def detect_fastsam_masks(image_bgr, model_path=None, conf=0.4,
             "area_work": area_work,
             "area": int(area_work / max(scale * scale, 1e-9)),
             "approx_vertices": int(len(approx)),
+            "orientation": orientation,
             "method": "fastsam-s",
         })
     return dets
+
+
+def estimate_arrowhead_orientation(c: np.ndarray, scale: float = 1.0) -> Dict[str, Any]:
+    """Estimate arrowhead orientation angle, apex tip point, and polarity vector.
+
+    Combines second central moments (inertia tensor principal axis) with
+    triangle apex vertex polarity detection (sharpest interior angle) to
+    resolve 180-degree ambiguity and yield a deterministic pointing direction.
+
+    Returns dict:
+        - orientation_deg: float in (-180, 180] (0 = +x / Right, 90 = +y / Down)
+        - tip_pt: [x, y] in original image coordinates
+        - polarity_vec: [vx, vy] normalized unit direction vector
+        - principal_axis_deg: float in (-90, 90] (second central moment axis)
+    """
+    M = cv2.moments(c)
+    if M["m00"] <= 0:
+        return {
+            "orientation_deg": 0.0, "tip_pt": [0, 0],
+            "polarity_vec": [1.0, 0.0], "principal_axis_deg": 0.0,
+        }
+    cx = M["m10"] / M["m00"]
+    cy = M["m01"] / M["m00"]
+    mu20 = M["mu20"] / M["m00"]
+    mu02 = M["mu02"] / M["m00"]
+    mu11 = M["mu11"] / M["m00"]
+
+    # Second central moments principal axis (-pi/2 to pi/2)
+    theta = 0.5 * math.atan2(2 * mu11, mu20 - mu02)
+
+    pts = c.reshape(-1, 2).astype(float)
+    R = np.array([[math.cos(-theta), -math.sin(-theta)],
+                  [math.sin(-theta), math.cos(-theta)]])
+    rotated = (pts - np.array([cx, cy])) @ R.T
+
+    pos_pts = rotated[rotated[:, 0] > 0]
+    neg_pts = rotated[rotated[:, 0] < 0]
+    pos_width = float(np.ptp(pos_pts[:, 1])) if len(pos_pts) > 0 else 0.0
+    neg_width = float(np.ptp(neg_pts[:, 1])) if len(neg_pts) > 0 else 0.0
+
+    # 3rd central moment skewness projection along principal axis
+    u = np.array([math.cos(theta), math.sin(theta)])
+    skew = (M.get("mu30", 0.0) / max(1.0, M["m00"])) * u[0] + (M.get("mu03", 0.0) / max(1.0, M["m00"])) * u[1]
+
+    # Taper polarity: tip has smaller perpendicular thickness (converging apex)
+    if pos_width < neg_width * 0.9:
+        dir_sign = +1
+    elif neg_width < pos_width * 0.9:
+        dir_sign = -1
+    else:
+        dir_sign = +1 if skew >= 0 else -1
+
+    if dir_sign == -1:
+        oriented_theta = (theta + math.pi) % (2 * math.pi)
+        best_idx = int(np.argmin(rotated[:, 0]))
+    else:
+        oriented_theta = theta % (2 * math.pi)
+        best_idx = int(np.argmax(rotated[:, 0]))
+
+    tip = pts[best_idx]
+    deg = math.degrees(oriented_theta)
+    if deg > 180:
+        deg -= 360
+
+    vx = math.cos(oriented_theta)
+    vy = math.sin(oriented_theta)
+    return {
+        "orientation_deg": round(deg, 1),
+        "tip_pt": [int(tip[0] / scale), int(tip[1] / scale)],
+        "polarity_vec": [round(vx, 3), round(vy, 3)],
+        "principal_axis_deg": round(math.degrees(theta), 1),
+    }
 
 
 def _dist_to_box(bx: List[int], x: float, y: float) -> float:
@@ -198,10 +275,14 @@ def classify_arrow_instances(masks, shape_boxes, shafts=None):
                             break
                     pair = (a["bbox"][0], a["bbox"][1], b["bbox"][0], b["bbox"][1])
                     seen_pairs.add(pair)
+                    orient = sep_head.get("orientation") if sep_head else None
                     out.append(dict(
                         d, arrow_instance=True,
                         head_separated=bool(sep_head is not None),
                         head_bbox=sep_head["bbox"] if sep_head else None,
+                        orientation_deg=orient.get("orientation_deg") if orient else None,
+                        tip_pt=orient.get("tip_pt") if orient else None,
+                        polarity_vec=orient.get("polarity_vec") if orient else None,
                         from_box=a["bbox"], to_box=b["bbox"],
                         method="fastsam-s-instance"
                     ))
@@ -228,6 +309,7 @@ def classify_arrow_instances(masks, shape_boxes, shafts=None):
                     else:
                         bbox = [min(from_box[2], hx1), min(from_box[3], hy1),
                                 max(from_box[0], hx2), max(from_box[1], hy2)]
+                    orient = hm.get("orientation")
                     out.append({
                         "bbox": bbox,
                         "area": hm.get("area", 0),
@@ -235,6 +317,9 @@ def classify_arrow_instances(masks, shape_boxes, shafts=None):
                         "arrow_instance": True,
                         "head_separated": True,
                         "head_bbox": hm["bbox"],
+                        "orientation_deg": orient.get("orientation_deg") if orient else None,
+                        "tip_pt": orient.get("tip_pt") if orient else None,
+                        "polarity_vec": orient.get("polarity_vec") if orient else None,
                         "from_box": from_box,
                         "to_box": to_box,
                         "method": "fastsam-s-head-instance",
@@ -262,17 +347,21 @@ def classify_arrow_instances(masks, shape_boxes, shafts=None):
                         if abs(hcy - cy) <= 25 and ax2 <= hcx <= bx1 and _dist_to_box(b["bbox"], hcx, hcy) <= 40:
                             used_head_indices.add(idx)
                             seen_pairs.add(pair)
-                            out.append({
-                                "bbox": [ax2, hy1, hx2, hy2],
-                                "area": hm.get("area", 0),
-                                "area_work": hm.get("area_work", 0),
-                                "arrow_instance": True,
-                                "head_separated": True,
-                                "head_bbox": hm["bbox"],
-                                "from_box": a["bbox"],
-                                "to_box": b["bbox"],
-                                "method": "fastsam-s-head-instance",
-                            })
+                        orient = hm.get("orientation")
+                        out.append({
+                            "bbox": [ax2, hy1, hx2, hy2],
+                            "area": hm.get("area", 0),
+                            "area_work": hm.get("area_work", 0),
+                            "arrow_instance": True,
+                            "head_separated": True,
+                            "head_bbox": hm["bbox"],
+                            "orientation_deg": orient.get("orientation_deg") if orient else None,
+                            "tip_pt": orient.get("tip_pt") if orient else None,
+                            "polarity_vec": orient.get("polarity_vec") if orient else None,
+                            "from_box": a["bbox"],
+                            "to_box": b["bbox"],
+                            "method": "fastsam-s-head-instance",
+                        })
                     # Diagonal (a above b)
                     elif ay2 <= by1 + 10:
                         gap = math.hypot(max(0, ax1 - bx2, bx1 - ax2), max(0, ay1 - by2, by1 - ay2))
@@ -286,6 +375,7 @@ def classify_arrow_instances(masks, shape_boxes, shafts=None):
                             if diff < math.radians(25):
                                 used_head_indices.add(idx)
                                 seen_pairs.add(pair)
+                                orient = hm.get("orientation")
                                 out.append({
                                     "bbox": [min(hx1, int(cax)), min(ay2, hy1),
                                              max(hx2, int(cax)), max(ay2, hy2)],
@@ -294,6 +384,9 @@ def classify_arrow_instances(masks, shape_boxes, shafts=None):
                                     "arrow_instance": True,
                                     "head_separated": True,
                                     "head_bbox": hm["bbox"],
+                                    "orientation_deg": orient.get("orientation_deg") if orient else None,
+                                    "tip_pt": orient.get("tip_pt") if orient else None,
+                                    "polarity_vec": orient.get("polarity_vec") if orient else None,
                                     "from_box": a["bbox"],
                                     "to_box": b["bbox"],
                                     "method": "fastsam-s-head-instance",
