@@ -22,9 +22,11 @@ from modules.fastsam_detection import (
 from modules.detection_contours import (
     DetectionContourExtractor,
     bind_edge_label_to_arrow,
+    compute_obstacle_avoidance_route,
     detect_arrow_shafts,
     detect_elbow_connectors,
     detect_shape_boxes,
+    segment_box_collision,
 )
 from modules.xml_merger import XMLMerger, XMLFragment
 from modules.data_types import LayerLevel, BoundingBox
@@ -397,6 +399,80 @@ class TestW2DetectionGaps(unittest.TestCase):
         self.assertEqual(len(arrows_z), 1)
         self.assertEqual(arrows_z[0]["connector_type"], "elbow")
         self.assertEqual(arrows_z[0]["bends"], 2)
+
+
+class TestObstacleAvoidance(unittest.TestCase):
+    def test_segment_box_collision(self):
+        box_o = [250, 150, 350, 250]
+        self.assertTrue(segment_box_collision((100, 200), (500, 200), box_o))
+        self.assertFalse(segment_box_collision((100, 100), (500, 100), box_o))
+        self.assertFalse(segment_box_collision((100, 300), (500, 300), box_o))
+
+    def test_compute_obstacle_avoidance_route_horizontal(self):
+        box_a = [50, 200, 150, 300]
+        box_b = [450, 200, 550, 300]
+        box_o = [250, 180, 350, 320]
+        route = compute_obstacle_avoidance_route(box_a, box_b, [box_o], clearance=25)
+        self.assertIsNotNone(route)
+        self.assertEqual(route["connector_type"], "obstacle_avoidance")
+        self.assertEqual(route["bends"], 4)
+        wpts = route["waypoints"]
+        self.assertEqual(len(wpts), 6)
+        for i in range(len(wpts) - 1):
+            self.assertFalse(segment_box_collision(wpts[i], wpts[i + 1], box_o, margin=0))
+
+    def test_compute_obstacle_avoidance_route_vertical(self):
+        box_a = [200, 50, 300, 150]
+        box_b = [200, 450, 300, 550]
+        box_o = [180, 250, 320, 350]
+        route = compute_obstacle_avoidance_route(box_a, box_b, [box_o], clearance=25)
+        self.assertIsNotNone(route)
+        self.assertEqual(route["connector_type"], "obstacle_avoidance")
+        self.assertEqual(route["bends"], 4)
+        wpts = route["waypoints"]
+        for i in range(len(wpts) - 1):
+            self.assertFalse(segment_box_collision(wpts[i], wpts[i + 1], box_o, margin=0))
+
+    def test_process_applies_obstacle_avoidance_to_drawio_xml(self):
+        ex = DetectionContourExtractor(fastsam_model_path="")
+        box_a = [50, 200, 150, 300]
+        box_o = [250, 180, 350, 320]
+        box_b = [450, 200, 550, 300]
+        shapes = [{"bbox": box_a}, {"bbox": box_o}, {"bbox": box_b}]
+        arrows = [{
+            "from_box": box_a, "to_box": box_b,
+            "shaft_confirmed": True, "head_separated": False,
+            "method": "hough_shaft_between_boxes"
+        }]
+
+        class Ctx:
+            def __init__(self):
+                self.image_path = SYNTH
+                self.elements = []
+                self.canvas_width = 600
+                self.canvas_height = 500
+                self.intermediate_results = {}
+        ctx = Ctx()
+        original_extract = ex.extract
+        ex.extract = lambda path, **kwargs: {
+            "canvas_width": 600, "canvas_height": 500,
+            "shapes": shapes, "arrows": arrows,
+            "yolo_boxes": [], "yolo_kept": [],
+            "yolo_available": False, "yolo_error": None, "yolo_model": None,
+            "fastsam_masks": [], "fastsam_arrow_instances": [],
+            "fastsam_shapes_kept": [], "fastsam_shapes_dropped": [],
+            "fastsam_available": False, "fastsam_error": None, "fastsam_model": None,
+        }
+        try:
+            res = ex.process(ctx)
+            self.assertEqual(res.metadata["arrows_obstacle_avoided"], 1)
+            arrow_elem = [e for e in ctx.elements if e.element_type == "arrow"][0]
+            self.assertIsNotNone(arrow_elem.vector_points)
+            self.assertGreaterEqual(len(arrow_elem.vector_points), 3)
+            self.assertEqual(arrow_elem.source_id, "0")
+            self.assertEqual(arrow_elem.target_id, "2")
+        finally:
+            ex.extract = original_extract
 
 
 if __name__ == "__main__":

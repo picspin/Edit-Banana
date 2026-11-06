@@ -155,7 +155,135 @@ def bind_edge_label_to_arrow(text_bbox: List[int], arrow_start: Tuple[int, int],
 
     if min_dist <= max_dist:
         return int(round(tcx - mid_x)), int(round(tcy - mid_y))
+def segment_box_collision(p1: Tuple[float, float], p2: Tuple[float, float],
+                          box: List[int], margin: float = 4.0) -> bool:
+    """Check if line segment p1->p2 intersects or pierces into box interior with margin."""
+    bx1, by1, bx2, by2 = box[0] - margin, box[1] - margin, box[2] + margin, box[3] + margin
+    if (bx1 < p1[0] < bx2 and by1 < p1[1] < by2) or (bx1 < p2[0] < bx2 and by1 < p2[1] < by2):
+        return True
+    dx = p2[0] - p1[0]
+    dy = p2[1] - p1[1]
+    p = [-dx, dx, -dy, dy]
+    q = [p1[0] - bx1, bx2 - p1[0], p1[1] - by1, by2 - p1[1]]
+    u1, u2 = 0.0, 1.0
+    for pi, qi in zip(p, q):
+        if pi == 0:
+            if qi < 0:
+                return False
+        else:
+            t = qi / pi
+            if pi < 0:
+                if t > u2:
+                    return False
+                if t > u1:
+                    u1 = t
+            else:
+                if t < u1:
+                    return False
+                if t < u2:
+                    u2 = t
+    return u1 < u2
+
+
+def compute_obstacle_avoidance_route(from_box: List[int], to_box: List[int],
+                                     obstacles: List[List[int]],
+                                     clearance: int = 25) -> Optional[Dict[str, Any]]:
+    """Compute orthogonal detour waypoints routing around intermediate obstacle boxes.
+
+    Returns dict with waypoints, bends count, and obstacles_avoided list, or None if no collision.
+    """
+    fcx, fcy = (from_box[0] + from_box[2]) / 2.0, (from_box[1] + from_box[3]) / 2.0
+    tcx, tcy = (to_box[0] + to_box[2]) / 2.0, (to_box[1] + to_box[3]) / 2.0
+
+    # 1. Horizontal span (left -> right or right -> left)
+    if abs(fcy - tcy) <= 40 and (from_box[2] < to_box[0] or to_box[2] < from_box[0]):
+        left_box = from_box if from_box[2] < to_box[0] else to_box
+        right_box = to_box if from_box[2] < to_box[0] else from_box
+        is_forward = (from_box is left_box)
+        lx2 = left_box[2]
+        rx1 = right_box[0]
+        y_level = int((fcy + tcy) / 2)
+
+        intervening = []
+        for o in obstacles:
+            if o == from_box or o == to_box:
+                continue
+            if o[0] >= lx2 - 10 and o[2] <= rx1 + 10:
+                if o[1] - clearance <= y_level <= o[3] + clearance:
+                    intervening.append(o)
+
+        if intervening:
+            min_ox1 = min(o[0] for o in intervening)
+            max_ox2 = max(o[2] for o in intervening)
+            min_oy1 = min(o[1] for o in intervening)
+            max_oy2 = max(o[3] for o in intervening)
+
+            top_y = int(min_oy1 - clearance)
+            bot_y = int(max_oy2 + clearance)
+            detour_y = top_y if abs(y_level - top_y) <= abs(bot_y - y_level) else bot_y
+            turn1_x = int((lx2 + min_ox1) / 2)
+            turn2_x = int((max_ox2 + rx1) / 2)
+
+            if is_forward:
+                wpts = [[lx2, y_level], [turn1_x, y_level], [turn1_x, detour_y],
+                        [turn2_x, detour_y], [turn2_x, y_level], [rx1, y_level]]
+            else:
+                wpts = [[rx1, y_level], [turn2_x, y_level], [turn2_x, detour_y],
+                        [turn1_x, detour_y], [turn1_x, y_level], [lx2, y_level]]
+
+            return {
+                "connector_type": "obstacle_avoidance",
+                "waypoints": wpts,
+                "bends": 4,
+                "obstacles_avoided": intervening,
+            }
+
+    # 2. Vertical span (top -> bottom or bottom -> top)
+    if abs(fcx - tcx) <= 40 and (from_box[3] < to_box[1] or to_box[3] < from_box[1]):
+        top_box = from_box if from_box[3] < to_box[1] else to_box
+        bot_box = to_box if from_box[3] < to_box[1] else from_box
+        is_down = (from_box is top_box)
+        ty2 = top_box[3]
+        by1 = bot_box[1]
+        x_level = int((fcx + tcx) / 2)
+
+        intervening = []
+        for o in obstacles:
+            if o == from_box or o == to_box:
+                continue
+            if o[1] >= ty2 - 10 and o[3] <= by1 + 10:
+                if o[0] - clearance <= x_level <= o[2] + clearance:
+                    intervening.append(o)
+
+        if intervening:
+            min_ox1 = min(o[0] for o in intervening)
+            max_ox2 = max(o[2] for o in intervening)
+            min_oy1 = min(o[1] for o in intervening)
+            max_oy2 = max(o[3] for o in intervening)
+
+            left_x = int(min_ox1 - clearance)
+            right_x = int(max_ox2 + clearance)
+            detour_x = left_x if abs(x_level - left_x) <= abs(right_x - x_level) else right_x
+            turn1_y = int((ty2 + min_oy1) / 2)
+            turn2_y = int((max_oy2 + by1) / 2)
+
+            if is_down:
+                wpts = [[x_level, ty2], [x_level, turn1_y], [detour_x, turn1_y],
+                        [detour_x, turn2_y], [x_level, turn2_y], [x_level, by1]]
+            else:
+                wpts = [[x_level, by1], [x_level, turn2_y], [detour_x, turn2_y],
+                        [detour_x, turn1_y], [x_level, turn1_y], [x_level, ty2]]
+
+            return {
+                "connector_type": "obstacle_avoidance",
+                "waypoints": wpts,
+                "bends": 4,
+                "obstacles_avoided": intervening,
+            }
+
     return None
+
+
 def detect_elbow_connectors(lines: List[Any], boxes: List[Dict[str, Any]],
                             image_bgr: Optional[np.ndarray] = None,
                             heads: Optional[List[List[int]]] = None,
@@ -550,8 +678,11 @@ class DetectionContourExtractor:
                 bbox=BoundingBox(x1=x1, y1=y1, x2=x2, y2=y2),
                 score=1.0, polygon=[[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
             ))
+        shapes_bboxes = [b["bbox"] for b in result["shapes"]]
         for j, a in enumerate(result["arrows"]):
-            if a.get("connector_type") == "elbow" and a.get("waypoints"):
+            fb = a["from_box"]
+            tb = a["to_box"]
+            if a.get("connector_type") in {"elbow", "obstacle_avoidance"} and a.get("waypoints"):
                 wpts = a["waypoints"]
                 abox = [min(p[0] for p in wpts), min(p[1] for p in wpts),
                         max(p[0] for p in wpts), max(p[1] for p in wpts)]
@@ -560,29 +691,40 @@ class DetectionContourExtractor:
                 arrow_end = tuple(wpts[-1])
                 vector_points = wpts[1:-1]
             else:
-                fb = a["from_box"]
-                tb = a["to_box"]
-                fcx, fcy = (fb[0] + fb[2]) / 2, (fb[1] + fb[3]) / 2
-                tcx, tcy = (tb[0] + tb[2]) / 2, (tb[1] + tb[3]) / 2
-                if abs(fcy - tcy) <= 30 and fb[2] < tb[0]:
-                    abox = [fb[2], min(fb[1], tb[1]), tb[0], max(fb[3], tb[3])]
-                    arrow_start = (fb[2], int((fb[1] + fb[3]) / 2))
-                    arrow_end = (tb[0], int((tb[1] + tb[3]) / 2))
-                elif abs(fcx - tcx) <= 30 and fb[3] < tb[1]:
-                    abox = [min(fb[0], tb[0]), fb[3], max(fb[2], tb[2]), tb[1]]
-                    arrow_start = (int((fb[0] + fb[2]) / 2), fb[3])
-                    arrow_end = (int((tb[0] + tb[2]) / 2), tb[1])
+                detour = compute_obstacle_avoidance_route(fb, tb, shapes_bboxes)
+                if detour:
+                    wpts = detour["waypoints"]
+                    abox = [min(p[0] for p in wpts), min(p[1] for p in wpts),
+                            max(p[0] for p in wpts), max(p[1] for p in wpts)]
+                    poly = wpts
+                    arrow_start = tuple(wpts[0])
+                    arrow_end = tuple(wpts[-1])
+                    vector_points = wpts[1:-1]
+                    a["connector_type"] = "obstacle_avoidance"
+                    a["waypoints"] = wpts
+                    a["bends"] = detour["bends"]
+                    a["obstacles_avoided"] = detour["obstacles_avoided"]
                 else:
-                    ex_x = fb[0] if tcx < fcx else fb[2]
-                    ex_y = fb[1] if tcy < fcy else fb[3]
-                    en_x = tb[2] if tcx < fcx else tb[0]
-                    en_y = tb[3] if tcy < fcy else tb[1]
-                    abox = [min(ex_x, en_x), min(ex_y, en_y), max(ex_x, en_x), max(ex_y, en_y)]
-                    arrow_start = (ex_x, ex_y)
-                    arrow_end = (en_x, en_y)
-                poly = []
-                vector_points = []
-            x1, y1, x2, y2 = abox
+                    fcx, fcy = (fb[0] + fb[2]) / 2, (fb[1] + fb[3]) / 2
+                    tcx, tcy = (tb[0] + tb[2]) / 2, (tb[1] + tb[3]) / 2
+                    if abs(fcy - tcy) <= 30 and fb[2] < tb[0]:
+                        abox = [fb[2], min(fb[1], tb[1]), tb[0], max(fb[3], tb[3])]
+                        arrow_start = (fb[2], int((fb[1] + fb[3]) / 2))
+                        arrow_end = (tb[0], int((tb[1] + tb[3]) / 2))
+                    elif abs(fcx - tcx) <= 30 and fb[3] < tb[1]:
+                        abox = [min(fb[0], tb[0]), fb[3], max(fb[2], tb[2]), tb[1]]
+                        arrow_start = (int((fb[0] + fb[2]) / 2), fb[3])
+                        arrow_end = (int((tb[0] + tb[2]) / 2), tb[1])
+                    else:
+                        ex_x = fb[0] if tcx < fcx else fb[2]
+                        ex_y = fb[1] if tcy < fcy else fb[3]
+                        en_x = tb[2] if tcx < fcx else tb[0]
+                        en_y = tb[3] if tcy < fcy else tb[1]
+                        abox = [min(ex_x, en_x), min(ex_y, en_y), max(ex_x, en_x), max(ex_y, en_y)]
+                        arrow_start = (ex_x, ex_y)
+                        arrow_end = (en_x, en_y)
+                    poly = []
+                    vector_points = []
             source_id = None
             target_id = None
             for s_idx, sb in enumerate(result["shapes"]):
@@ -650,7 +792,7 @@ class DetectionContourExtractor:
                 "arrows_shaft_confirmed": len(result["arrows"]),
                 "arrows_head_separated": sum(1 for a in result["arrows"] if a.get("head_separated")),
                 "arrows_elbow": sum(1 for a in result["arrows"] if a.get("connector_type") == "elbow"),
-                "yolo_boxes": len(result.get("yolo_boxes", [])),
+                "arrows_obstacle_avoided": sum(1 for a in result["arrows"] if a.get("connector_type") == "obstacle_avoidance"),
                 "yolo_kept": len(result.get("yolo_kept", [])),
                 "yolo_available": result.get("yolo_available", False),
                 "yolo_error": result.get("yolo_error"),
