@@ -52,6 +52,8 @@ reported for audit only and are NOT promoted to pipeline
 elements, to avoid the round-3 dense-diagram overfire.
 """
 
+import heapq
+import itertools
 import math
 import os
 from typing import Any, Dict, List, Optional, Tuple
@@ -184,16 +186,92 @@ def segment_box_collision(p1: Tuple[float, float], p2: Tuple[float, float],
                     u2 = t
     return u1 < u2
 
+def hanan_grid_route(start_pt: Tuple[int, int], end_pt: Tuple[int, int],
+                     obstacles: List[List[int]], clearance: int = 25,
+                     bend_penalty: int = 80) -> Optional[List[List[int]]]:
+    """Find shortest orthogonal collision-free path with minimal bends on Hanan grid.
+
+    Hanan grid uses orthogonal lines through terminals and obstacle boundaries.
+    Edge collisions with any obstacle box interior are pruned using Liang-Barsky.
+    A* cost = Manhattan distance + bend_penalty * (direction changes).
+    """
+    xs = {int(start_pt[0]), int(end_pt[0])}
+    ys = {int(start_pt[1]), int(end_pt[1])}
+    for o in obstacles:
+        xs.add(int(o[0] - clearance))
+        xs.add(int(o[2] + clearance))
+        ys.add(int(o[1] - clearance))
+        ys.add(int(o[3] + clearance))
+
+    sorted_x = sorted(list(xs))
+    sorted_y = sorted(list(ys))
+
+    x_map = {x: i for i, x in enumerate(sorted_x)}
+    y_map = {y: i for i, y in enumerate(sorted_y)}
+
+    start_node = (x_map[int(start_pt[0])], y_map[int(start_pt[1])])
+    target_node = (x_map[int(end_pt[0])], y_map[int(end_pt[1])])
+
+    counter = itertools.count()
+    pq = [(0, 0, next(counter), start_node[0], start_node[1], 0, [[int(start_pt[0]), int(start_pt[1])]])]
+    visited = {}
+
+    while pq:
+        f, cost, _, xi, yi, prev_dir, path = heapq.heappop(pq)
+        state = (xi, yi, prev_dir)
+        if state in visited and visited[state] <= cost:
+            continue
+        visited[state] = cost
+
+        curr_pt = (sorted_x[xi], sorted_y[yi])
+        if (xi, yi) == target_node:
+            simplified = [path[0]]
+            for pt in path[1:]:
+                if len(simplified) >= 2:
+                    p_prev = simplified[-2]
+                    p_last = simplified[-1]
+                    if (p_prev[0] == p_last[0] == pt[0]) or (p_prev[1] == p_last[1] == pt[1]):
+                        simplified[-1] = pt
+                        continue
+                simplified.append(pt)
+            return simplified
+
+        neighbors = []
+        if xi > 0: neighbors.append((xi - 1, yi, 2))
+        if xi < len(sorted_x) - 1: neighbors.append((xi + 1, yi, 1))
+        if yi > 0: neighbors.append((xi, yi - 1, 4))
+        if yi < len(sorted_y) - 1: neighbors.append((xi, yi + 1, 3))
+
+        for n_xi, n_yi, n_dir in neighbors:
+            nxt_pt = (sorted_x[n_xi], sorted_y[n_yi])
+            collides = any(segment_box_collision(curr_pt, nxt_pt, o, margin=2.0) for o in obstacles)
+            if collides:
+                continue
+            seg_dist = abs(nxt_pt[0] - curr_pt[0]) + abs(nxt_pt[1] - curr_pt[1])
+            turn_cost = bend_penalty if (prev_dir != 0 and prev_dir != n_dir) else 0
+            n_cost = cost + seg_dist + turn_cost
+            h = abs(nxt_pt[0] - end_pt[0]) + abs(nxt_pt[1] - end_pt[1])
+            heapq.heappush(pq, (n_cost + h, n_cost, next(counter), n_xi, n_yi, n_dir, path + [[nxt_pt[0], nxt_pt[1]]]))
+
+    return None
+
 
 def compute_obstacle_avoidance_route(from_box: List[int], to_box: List[int],
                                      obstacles: List[List[int]],
-                                     clearance: int = 25) -> Optional[Dict[str, Any]]:
+                                     clearance: int = 25,
+                                     lane_index: int = 0,
+                                     lane_spacing: int = 15) -> Optional[Dict[str, Any]]:
     """Compute orthogonal detour waypoints routing around intermediate obstacle boxes.
 
-    Returns dict with waypoints, bends count, and obstacles_avoided list, or None if no collision.
+    Supports lane offset allocation (channel separation) and falls back to Hanan-grid
+    A* routing when multi-obstacle mazes or blocking obstacles prevent simple 4-bend detour.
+    Returns dict with waypoints, bends count, obstacles_avoided list, routing_method, and lane_index.
     """
+    effective_clearance = clearance + lane_index * lane_spacing
     fcx, fcy = (from_box[0] + from_box[2]) / 2.0, (from_box[1] + from_box[3]) / 2.0
     tcx, tcy = (to_box[0] + to_box[2]) / 2.0, (to_box[1] + to_box[3]) / 2.0
+
+    other_obs = [o for o in obstacles if o != from_box and o != to_box]
 
     # 1. Horizontal span (left -> right or right -> left)
     if abs(fcy - tcy) <= 40 and (from_box[2] < to_box[0] or to_box[2] < from_box[0]):
@@ -204,39 +282,56 @@ def compute_obstacle_avoidance_route(from_box: List[int], to_box: List[int],
         rx1 = right_box[0]
         y_level = int((fcy + tcy) / 2)
 
-        intervening = []
-        for o in obstacles:
-            if o == from_box or o == to_box:
-                continue
-            if o[0] >= lx2 - 10 and o[2] <= rx1 + 10:
-                if o[1] - clearance <= y_level <= o[3] + clearance:
-                    intervening.append(o)
-
+        intervening = [o for o in other_obs if o[0] >= lx2 - 10 and o[2] <= rx1 + 10
+                       and o[1] - effective_clearance <= y_level <= o[3] + effective_clearance]
         if intervening:
             min_ox1 = min(o[0] for o in intervening)
             max_ox2 = max(o[2] for o in intervening)
             min_oy1 = min(o[1] for o in intervening)
             max_oy2 = max(o[3] for o in intervening)
 
-            top_y = int(min_oy1 - clearance)
-            bot_y = int(max_oy2 + clearance)
-            detour_y = top_y if abs(y_level - top_y) <= abs(bot_y - y_level) else bot_y
             turn1_x = int((lx2 + min_ox1) / 2)
             turn2_x = int((max_ox2 + rx1) / 2)
 
-            if is_forward:
-                wpts = [[lx2, y_level], [turn1_x, y_level], [turn1_x, detour_y],
-                        [turn2_x, detour_y], [turn2_x, y_level], [rx1, y_level]]
-            else:
-                wpts = [[rx1, y_level], [turn2_x, y_level], [turn2_x, detour_y],
-                        [turn1_x, detour_y], [turn1_x, y_level], [lx2, y_level]]
+            top_y = int(min_oy1 - effective_clearance)
+            bot_y = int(max_oy2 + effective_clearance)
 
-            return {
-                "connector_type": "obstacle_avoidance",
-                "waypoints": wpts,
-                "bends": 4,
-                "obstacles_avoided": intervening,
-            }
+            candidates = []
+            for detour_y in [top_y, bot_y]:
+                if is_forward:
+                    w = [[lx2, y_level], [turn1_x, y_level], [turn1_x, detour_y],
+                         [turn2_x, detour_y], [turn2_x, y_level], [rx1, y_level]]
+                else:
+                    w = [[rx1, y_level], [turn2_x, y_level], [turn2_x, detour_y],
+                         [turn1_x, detour_y], [turn1_x, y_level], [lx2, y_level]]
+                collides = any(segment_box_collision(w[i], w[i+1], o, margin=2.0)
+                               for i in range(len(w) - 1) for o in other_obs)
+                if not collides:
+                    candidates.append((abs(y_level - detour_y), w))
+
+            if candidates:
+                candidates.sort(key=lambda c: c[0])
+                best_w = candidates[0][1]
+                return {
+                    "connector_type": "obstacle_avoidance",
+                    "waypoints": best_w,
+                    "bends": 4,
+                    "obstacles_avoided": intervening,
+                    "routing_method": "orthogonal_detour",
+                    "lane_index": lane_index,
+                }
+            start_pt = (lx2, y_level) if is_forward else (rx1, y_level)
+            end_pt = (rx1, y_level) if is_forward else (lx2, y_level)
+            hanan_w = hanan_grid_route(start_pt, end_pt, other_obs, clearance=effective_clearance)
+            if hanan_w:
+                return {
+                    "connector_type": "obstacle_avoidance",
+                    "waypoints": hanan_w,
+                    "bends": max(0, len(hanan_w) - 2),
+                    "obstacles_avoided": intervening,
+                    "routing_method": "hanan_grid_astar",
+                    "lane_index": lane_index,
+                }
 
     # 2. Vertical span (top -> bottom or bottom -> top)
     if abs(fcx - tcx) <= 40 and (from_box[3] < to_box[1] or to_box[3] < from_box[1]):
@@ -247,38 +342,73 @@ def compute_obstacle_avoidance_route(from_box: List[int], to_box: List[int],
         by1 = bot_box[1]
         x_level = int((fcx + tcx) / 2)
 
-        intervening = []
-        for o in obstacles:
-            if o == from_box or o == to_box:
-                continue
-            if o[1] >= ty2 - 10 and o[3] <= by1 + 10:
-                if o[0] - clearance <= x_level <= o[2] + clearance:
-                    intervening.append(o)
-
+        intervening = [o for o in other_obs if o[1] >= ty2 - 10 and o[3] <= by1 + 10
+                       and o[0] - effective_clearance <= x_level <= o[2] + effective_clearance]
         if intervening:
             min_ox1 = min(o[0] for o in intervening)
             max_ox2 = max(o[2] for o in intervening)
             min_oy1 = min(o[1] for o in intervening)
             max_oy2 = max(o[3] for o in intervening)
 
-            left_x = int(min_ox1 - clearance)
-            right_x = int(max_ox2 + clearance)
-            detour_x = left_x if abs(x_level - left_x) <= abs(right_x - x_level) else right_x
             turn1_y = int((ty2 + min_oy1) / 2)
             turn2_y = int((max_oy2 + by1) / 2)
 
-            if is_down:
-                wpts = [[x_level, ty2], [x_level, turn1_y], [detour_x, turn1_y],
-                        [detour_x, turn2_y], [x_level, turn2_y], [x_level, by1]]
-            else:
-                wpts = [[x_level, by1], [x_level, turn2_y], [detour_x, turn2_y],
-                        [detour_x, turn1_y], [x_level, turn1_y], [x_level, ty2]]
+            left_x = int(min_ox1 - effective_clearance)
+            right_x = int(max_ox2 + effective_clearance)
 
+            candidates = []
+            for detour_x in [left_x, right_x]:
+                if is_down:
+                    w = [[x_level, ty2], [x_level, turn1_y], [detour_x, turn1_y],
+                         [detour_x, turn2_y], [x_level, turn2_y], [x_level, by1]]
+                else:
+                    w = [[x_level, by1], [x_level, turn2_y], [detour_x, turn2_y],
+                         [detour_x, turn1_y], [x_level, turn1_y], [x_level, ty2]]
+                collides = any(segment_box_collision(w[i], w[i+1], o, margin=2.0)
+                               for i in range(len(w) - 1) for o in other_obs)
+                if not collides:
+                    candidates.append((abs(x_level - detour_x), w))
+
+            if candidates:
+                candidates.sort(key=lambda c: c[0])
+                best_w = candidates[0][1]
+                return {
+                    "connector_type": "obstacle_avoidance",
+                    "waypoints": best_w,
+                    "bends": 4,
+                    "obstacles_avoided": intervening,
+                    "routing_method": "orthogonal_detour",
+                    "lane_index": lane_index,
+                }
+            start_pt = (x_level, ty2) if is_down else (x_level, by1)
+            end_pt = (x_level, by1) if is_down else (x_level, ty2)
+            hanan_w = hanan_grid_route(start_pt, end_pt, other_obs, clearance=effective_clearance)
+            if hanan_w:
+                return {
+                    "connector_type": "obstacle_avoidance",
+                    "waypoints": hanan_w,
+                    "bends": max(0, len(hanan_w) - 2),
+                    "obstacles_avoided": intervening,
+                    "routing_method": "hanan_grid_astar",
+                    "lane_index": lane_index,
+                }
+
+    # 3. Arbitrary / diagonal span with intervening collision
+    ex_x = from_box[0] if tcx < fcx else from_box[2]
+    ex_y = from_box[1] if tcy < fcy else from_box[3]
+    en_x = to_box[2] if tcx < fcx else to_box[0]
+    en_y = to_box[3] if tcy < fcy else to_box[1]
+    direct_colliding = [o for o in other_obs if segment_box_collision((ex_x, ex_y), (en_x, en_y), o, margin=2.0)]
+    if direct_colliding:
+        hanan_w = hanan_grid_route((ex_x, ex_y), (en_x, en_y), other_obs, clearance=effective_clearance)
+        if hanan_w:
             return {
                 "connector_type": "obstacle_avoidance",
-                "waypoints": wpts,
-                "bends": 4,
-                "obstacles_avoided": intervening,
+                "waypoints": hanan_w,
+                "bends": max(0, len(hanan_w) - 2),
+                "obstacles_avoided": direct_colliding,
+                "routing_method": "hanan_grid_astar",
+                "lane_index": lane_index,
             }
 
     return None
@@ -679,6 +809,7 @@ class DetectionContourExtractor:
                 score=1.0, polygon=[[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
             ))
         shapes_bboxes = [b["bbox"] for b in result["shapes"]]
+        obstacle_lane_counts: Dict[Any, int] = {}
         for j, a in enumerate(result["arrows"]):
             fb = a["from_box"]
             tb = a["to_box"]
@@ -693,6 +824,11 @@ class DetectionContourExtractor:
             else:
                 detour = compute_obstacle_avoidance_route(fb, tb, shapes_bboxes)
                 if detour:
+                    obs_key = tuple(sorted((o[0], o[1], o[2], o[3]) for o in detour["obstacles_avoided"]))
+                    lane_idx = obstacle_lane_counts.get(obs_key, 0)
+                    obstacle_lane_counts[obs_key] = lane_idx + 1
+                    if lane_idx > 0:
+                        detour = compute_obstacle_avoidance_route(fb, tb, shapes_bboxes, lane_index=lane_idx) or detour
                     wpts = detour["waypoints"]
                     abox = [min(p[0] for p in wpts), min(p[1] for p in wpts),
                             max(p[0] for p in wpts), max(p[1] for p in wpts)]
@@ -704,6 +840,8 @@ class DetectionContourExtractor:
                     a["waypoints"] = wpts
                     a["bends"] = detour["bends"]
                     a["obstacles_avoided"] = detour["obstacles_avoided"]
+                    a["routing_method"] = detour.get("routing_method", "orthogonal_detour")
+                    a["lane_index"] = detour.get("lane_index", lane_idx)
                 else:
                     fcx, fcy = (fb[0] + fb[2]) / 2, (fb[1] + fb[3]) / 2
                     tcx, tcy = (tb[0] + tb[2]) / 2, (tb[1] + tb[3]) / 2

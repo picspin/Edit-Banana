@@ -26,6 +26,7 @@ from modules.detection_contours import (
     detect_arrow_shafts,
     detect_elbow_connectors,
     detect_shape_boxes,
+    hanan_grid_route,
     segment_box_collision,
 )
 from modules.xml_merger import XMLMerger, XMLFragment
@@ -471,6 +472,106 @@ class TestObstacleAvoidance(unittest.TestCase):
             self.assertGreaterEqual(len(arrow_elem.vector_points), 3)
             self.assertEqual(arrow_elem.source_id, "0")
             self.assertEqual(arrow_elem.target_id, "2")
+        finally:
+            ex.extract = original_extract
+
+    def test_channel_separation_lane_offsets(self):
+        box_a = [50, 200, 150, 300]
+        box_b = [450, 200, 550, 300]
+        box_o = [250, 180, 350, 320]
+        r0 = compute_obstacle_avoidance_route(box_a, box_b, [box_o], clearance=25, lane_index=0)
+        r1 = compute_obstacle_avoidance_route(box_a, box_b, [box_o], clearance=25, lane_index=1, lane_spacing=15)
+        self.assertIsNotNone(r0)
+        self.assertIsNotNone(r1)
+        self.assertEqual(r0["lane_index"], 0)
+        self.assertEqual(r1["lane_index"], 1)
+        # r1's detour track is offset by 15 px further away from obstacle than r0
+        self.assertEqual(abs(r0["waypoints"][2][1] - r1["waypoints"][2][1]), 15)
+        for r in [r0, r1]:
+            for i in range(len(r["waypoints"]) - 1):
+                self.assertFalse(segment_box_collision(r["waypoints"][i], r["waypoints"][i+1], box_o, margin=0))
+
+    def test_detour_selects_unblocked_candidate_side(self):
+        box_a = [50, 200, 150, 300]
+        box_b = [450, 200, 550, 300]
+        box_o1 = [250, 180, 350, 320]
+        box_o2 = [250, 80, 350, 175]  # blocks top candidate detour
+        route = compute_obstacle_avoidance_route(box_a, box_b, [box_o1, box_o2], clearance=25)
+        self.assertIsNotNone(route)
+        self.assertEqual(route["routing_method"], "orthogonal_detour")
+        # Must have chosen bottom detour
+        self.assertGreaterEqual(route["waypoints"][2][1], 345)
+        for i in range(len(route["waypoints"]) - 1):
+            self.assertFalse(segment_box_collision(route["waypoints"][i], route["waypoints"][i+1], box_o1, margin=0))
+            self.assertFalse(segment_box_collision(route["waypoints"][i], route["waypoints"][i+1], box_o2, margin=0))
+
+    def test_hanan_grid_astar_maze_fallback(self):
+        box_a = [50, 200, 150, 300]
+        box_b = [450, 200, 550, 300]
+        box_o1 = [250, 180, 350, 320]
+        box_o2 = [250, 80, 350, 175]   # blocks top
+        box_o3 = [250, 325, 350, 420]  # blocks bottom
+        route = compute_obstacle_avoidance_route(box_a, box_b, [box_o1, box_o2, box_o3], clearance=25)
+        self.assertIsNotNone(route)
+        self.assertEqual(route["routing_method"], "hanan_grid_astar")
+        for i in range(len(route["waypoints"]) - 1):
+            p1 = route["waypoints"][i]
+            p2 = route["waypoints"][i+1]
+            for obs in [box_o1, box_o2, box_o3]:
+                self.assertFalse(segment_box_collision(p1, p2, obs, margin=0))
+
+    def test_diagonal_obstacle_avoidance_hanan_grid(self):
+        start_pt = (150, 100)
+        end_pt = (450, 500)
+        box_o = [200, 200, 350, 350]
+        # Direct diagonal segment collides
+        self.assertTrue(segment_box_collision(start_pt, end_pt, box_o))
+        route = hanan_grid_route(start_pt, end_pt, [box_o], clearance=25)
+        self.assertIsNotNone(route)
+        self.assertEqual(route[0], [150, 100])
+        self.assertEqual(route[-1], [450, 500])
+        for i in range(len(route) - 1):
+            self.assertFalse(segment_box_collision(route[i], route[i+1], box_o, margin=0))
+
+    def test_process_multiple_arrows_channel_separation(self):
+        ex = DetectionContourExtractor(fastsam_model_path="")
+        box_a = [50, 200, 150, 300]
+        box_o = [250, 180, 350, 320]
+        box_b = [450, 200, 550, 300]
+        shapes = [{"bbox": box_a}, {"bbox": box_o}, {"bbox": box_b}]
+        # Two arrows avoiding the same obstacle
+        arrows = [
+            {"from_box": box_a, "to_box": box_b, "shaft_confirmed": True, "head_separated": False, "method": "test"},
+            {"from_box": box_a, "to_box": box_b, "shaft_confirmed": True, "head_separated": False, "method": "test"},
+        ]
+        class Ctx:
+            def __init__(self):
+                self.image_path = SYNTH
+                self.elements = []
+                self.canvas_width = 600
+                self.canvas_height = 500
+                self.intermediate_results = {}
+        ctx = Ctx()
+        original_extract = ex.extract
+        ex.extract = lambda path, **kwargs: {
+            "canvas_width": 600, "canvas_height": 500,
+            "shapes": shapes, "arrows": arrows,
+            "yolo_boxes": [], "yolo_kept": [],
+            "yolo_available": False, "yolo_error": None, "yolo_model": None,
+            "fastsam_masks": [], "fastsam_arrow_instances": [],
+            "fastsam_shapes_kept": [], "fastsam_shapes_dropped": [],
+            "fastsam_available": False, "fastsam_error": None, "fastsam_model": None,
+        }
+        try:
+            res = ex.process(ctx)
+            self.assertEqual(res.metadata["arrows_obstacle_avoided"], 2)
+            arrow_elems = [e for e in ctx.elements if e.element_type == "arrow"]
+            self.assertEqual(len(arrow_elems), 2)
+            w0 = arrow_elems[0].vector_points
+            w1 = arrow_elems[1].vector_points
+            # Channel separation ensures waypoints are distinct and separated by 15 px
+            self.assertNotEqual(w0, w1)
+            self.assertEqual(abs(w0[1][1] - w1[1][1]), 15)
         finally:
             ex.extract = original_extract
 
