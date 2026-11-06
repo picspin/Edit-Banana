@@ -123,11 +123,15 @@ class ElementInfo:
     arrow_end: Optional[tuple] = None            # 箭头终点
     vector_points: Optional[List[List[int]]] = None  # 矢量箭头路径点 [[x,y], [x,y], ...]
     arrow_style: Optional[str] = None            # 箭头样式（classic, open等）
-    
+    source_id: Optional[str] = None              # 起始图形 ID（用于 DrawIO 连线 source 属性）
+    target_id: Optional[str] = None              # 目标图形 ID（用于 DrawIO 连线 target 属性）
+    edge_parent_id: Optional[str] = None         # 作为连线标签时所属边 ID
+    edge_offset: Optional[tuple] = None          # 相对连线中心 (offset_x, offset_y)
+    text_content: Optional[str] = None           # 文字内容（供文本/边标签用）
+
     # === 元数据 ===
     source_prompt: Optional[str] = None          # 触发此元素识别的prompt
     processing_notes: List[str] = field(default_factory=list)  # 处理过程中的备注
-    
     def has_xml(self) -> bool:
         """检查是否已生成XML"""
         return self.xml_fragment is not None and len(self.xml_fragment.strip()) > 0
@@ -141,6 +145,11 @@ class ElementInfo:
             'score': self.score,
             'polygon': self.polygon,
             'layer_level': self.layer_level,
+            'source_id': self.source_id,
+            'target_id': self.target_id,
+            'edge_parent_id': self.edge_parent_id,
+            'edge_offset': list(self.edge_offset) if self.edge_offset else None,
+            'text_content': self.text_content,
             'has_xml': self.has_xml(),
             'source_prompt': self.source_prompt,
         }

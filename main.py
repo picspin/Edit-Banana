@@ -32,6 +32,7 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
 
 from modules import (
+    DetectionContourExtractor,
     # Core processors
     Sam3InfoExtractor,
     IconPictureProcessor,
@@ -51,8 +52,11 @@ from modules import (
     get_layer_level,
 )
 
-# Prompt groups enum
-from modules.sam3_info_extractor import PromptGroup
+# Prompt groups enum (SAM3-only; detection branch runs without torch)
+try:
+    from modules.sam3_info_extractor import PromptGroup
+except Exception:
+    PromptGroup = None
 
 # Text module available (depends on ocr/coord_processor etc.)
 TEXT_MODULE_AVAILABLE = TextRestorer is not None
@@ -106,6 +110,12 @@ class Pipeline:
         if self._sam3_extractor is None:
             self._sam3_extractor = Sam3InfoExtractor()
         return self._sam3_extractor
+
+    @property
+    def detection_extractor(self) -> DetectionContourExtractor:
+        if getattr(self, '_detection_extractor', None) is None:
+            self._detection_extractor = DetectionContourExtractor()
+        return self._detection_extractor
     
     @property
     def icon_processor(self) -> IconPictureProcessor:
@@ -185,11 +195,13 @@ class Pipeline:
             else:
                 print("\n[1] Text extraction (skipped)")
 
-            print("\n[2] Segmentation (SAM3)...")
+            print("\n[2] Segmentation (detection contours by default; SAM3 only if EDITBANANA_USE_SAM3=1)...")
 
             if groups:
                 # Extract by group
                 all_elements = []
+                if os.environ.get("EDITBANANA_USE_SAM3") != "1":
+                    raise Exception("Group extraction requires SAM3; set EDITBANANA_USE_SAM3=1 or use full detection extraction")
                 for group in groups:
                     result = self.sam3_extractor.extract_by_group(context, group)
                     all_elements.extend(result.elements)
@@ -199,19 +211,34 @@ class Pipeline:
                 context.canvas_width = result.canvas_width
                 context.canvas_height = result.canvas_height
             else:
-                # Full extraction
-                result = self.sam3_extractor.process(context)
-                if not result.success:
-                    raise Exception(f"SAM3 extraction failed: {result.error_message}")
-                context.elements = result.elements
-                context.canvas_width = result.canvas_width
-                context.canvas_height = result.canvas_height
-            
+                # Full extraction: detection contours by default in this
+                # branch (no SAM, no torch). SAM3 is opt-in only.
+                if os.environ.get("EDITBANANA_USE_SAM3") == "1":
+                    result = self.sam3_extractor.process(context)
+                    if not result.success:
+                        raise Exception(f"SAM3 extraction failed: {result.error_message}")
+                    context.elements = result.elements
+                    context.canvas_width = result.canvas_width
+                    context.canvas_height = result.canvas_height
+                else:
+                    result = self.detection_extractor.process(context)
+                    if not result.success:
+                        raise Exception(f"Detection extraction failed: {result.error_message}")
+                    context.elements = result.elements
+                    context.canvas_width = result.canvas_width
+                    context.canvas_height = result.canvas_height
+
             print(f"   Elements: {len(context.elements)}")
-            vis_path = os.path.join(img_output_dir, "sam3_extraction.png")
-            self.sam3_extractor.save_visualization(context, vis_path)
-            meta_path = os.path.join(img_output_dir, "sam3_metadata.json")
-            self.sam3_extractor.save_metadata(context, meta_path)
+            if os.environ.get("EDITBANANA_USE_SAM3") == "1":
+                vis_path = os.path.join(img_output_dir, "sam3_extraction.png")
+                self.sam3_extractor.save_visualization(context, vis_path)
+                meta_path = os.path.join(img_output_dir, "sam3_metadata.json")
+                self.sam3_extractor.save_metadata(context, meta_path)
+            else:
+                vis_path = os.path.join(img_output_dir, "detection_extraction.png")
+                self.detection_extractor.save_visualization(context, vis_path)
+                meta_path = os.path.join(img_output_dir, "detection_metadata.json")
+                self.detection_extractor.save_metadata(context, meta_path)
 
             print("\n[3] Shape/icon processing...")
             result = self.icon_processor.process(context)
@@ -282,21 +309,53 @@ class Pipeline:
             
             elem_type = elem.element_type.lower()
             
-            if elem_type in {'icon', 'picture', 'logo', 'chart', 'function_graph', 'arrow', 'line', 'connector'}:
-                # Image/arrow: use base64 image
+            if elem_type in {'arrow', 'line', 'connector'}:
+                if elem.arrow_start and elem.arrow_end:
+                    sx, sy = elem.arrow_start
+                    tx, ty = elem.arrow_end
+                    pts_xml = ""
+                    if elem.vector_points:
+                        inner_pts = "\n".join([f'      <mxPoint x="{p[0]}" y="{p[1]}"/>' for p in elem.vector_points])
+                        pts_xml = f'''\n    <Array as="points">\n{inner_pts}\n    </Array>'''
+                    source_attr = f' source="{elem.source_id}"' if elem.source_id is not None else ""
+                    target_attr = f' target="{elem.target_id}"' if elem.target_id is not None else ""
+                    edge_style = "edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;strokeColor=#000000;strokeWidth=2;"
+                    elem.layer_level = LayerLevel.ARROW.value
+                    elem.xml_fragment = f'''<mxCell id="{elem.id}" parent="1" edge="1"{source_attr}{target_attr} style="{edge_style}">
+  <mxGeometry relative="1" as="geometry">
+    <mxPoint x="{sx}" y="{sy}" as="sourcePoint"/>
+    <mxPoint x="{tx}" y="{ty}" as="targetPoint"/>{pts_xml}
+  </mxGeometry>
+</mxCell>'''
+                    continue
+                # Fallback to image crop if no vector endpoints
                 if elem.base64:
                     style = f"shape=image;imageAspect=0;aspect=fixed;verticalLabelPosition=bottom;verticalAlign=top;image=data:image/png,{elem.base64}"
                 else:
                     style = "rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;"
                 elem.layer_level = LayerLevel.IMAGE.value
-                
+            elif elem_type in {'icon', 'picture', 'logo', 'chart', 'function_graph'}:
+                if elem.base64:
+                    style = f"shape=image;imageAspect=0;aspect=fixed;verticalLabelPosition=bottom;verticalAlign=top;image=data:image/png,{elem.base64}"
+                else:
+                    style = "rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;"
+                elem.layer_level = LayerLevel.IMAGE.value
             elif elem_type in {'section_panel', 'title_bar'}:
                 # Background/container
                 fill = elem.fill_color or "#ffffff"
                 stroke = elem.stroke_color or "#000000"
                 style = f"rounded=0;whiteSpace=wrap;html=1;fillColor={fill};strokeColor={stroke};dashed=1;"
-                elem.layer_level = LayerLevel.BACKGROUND.value
-                
+            elif (elem_type in {'edge_label', 'text'} or elem.edge_parent_id) and elem.edge_offset:
+                ox, oy = elem.edge_offset
+                label_val = elem.text_content or ""
+                label_style = "edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];"
+                elem.layer_level = LayerLevel.TEXT.value
+                elem.xml_fragment = f'''<mxCell id="{elem.id}" value="{label_val}" style="{label_style}" parent="{elem.edge_parent_id}" vertex="1" connectable="0">
+  <mxGeometry relative="1" as="geometry">
+    <mxPoint x="{ox}" y="{oy}" as="offset"/>
+  </mxGeometry>
+</mxCell>'''
+                continue
             else:
                 # Basic shape
                 fill = elem.fill_color or "#ffffff"

@@ -12,7 +12,13 @@ from .data_types import (
     LayerLevel,
     get_layer_level,
 )
-from .sam3_info_extractor import Sam3InfoExtractor
+try:
+    from .sam3_info_extractor import Sam3InfoExtractor
+except Exception:
+    # SAM3/torch is optional in the detection-contour branch; detection
+    # must work without it. SAM3 path fails loudly when chosen.
+    Sam3InfoExtractor = None
+from .detection_contours import DetectionContourExtractor
 from .xml_merger import XMLMerger
 
 # Shape/icon processors
@@ -47,6 +53,7 @@ __all__ = [
     
     # Core
     'Sam3InfoExtractor',
+    'DetectionContourExtractor',
     'XMLMerger',
     # Shape/icon
     'IconPictureProcessor',
