@@ -336,7 +336,36 @@ class TestPortAndEdgeLabel(unittest.TestCase):
         self.assertIn('connectable="0"', text_frag.xml_content)
         self.assertIn('as="offset"', text_frag.xml_content)
 
+    def test_xml_merger_remapping_source_target_parent(self):
+        import xml.etree.ElementTree as ET
+        merger = XMLMerger()
+        shape0_xml = '<mxCell id="0" parent="1" vertex="1" style="rounded=0;"><mxGeometry x="50" y="50" width="100" height="80" as="geometry"/></mxCell>'
+        shape1_xml = '<mxCell id="1" parent="1" vertex="1" style="rounded=0;"><mxGeometry x="300" y="50" width="100" height="80" as="geometry"/></mxCell>'
+        edge_xml = '<mxCell id="4" parent="1" edge="1" source="0" target="1" style="edgeStyle=orthogonalEdgeStyle;"><mxGeometry relative="1" as="geometry"><mxPoint x="150" y="90" as="sourcePoint"/><mxPoint x="300" y="90" as="targetPoint"/></mxGeometry></mxCell>'
+        label_xml = '<mxCell id="text_1" value="Next" parent="4" vertex="1" connectable="0"><mxGeometry relative="1" as="geometry"><mxPoint x="0" y="-15" as="offset"/></mxGeometry></mxCell>'
 
+        frags = [
+            XMLFragment(element_id="0", xml_content=shape0_xml, layer_level=LayerLevel.BASIC_SHAPE.value, bbox=BoundingBox(50, 50, 150, 130), element_type="rectangle"),
+            XMLFragment(element_id="1", xml_content=shape1_xml, layer_level=LayerLevel.BASIC_SHAPE.value, bbox=BoundingBox(300, 50, 400, 130), element_type="rectangle"),
+            XMLFragment(element_id="4", xml_content=edge_xml, layer_level=LayerLevel.ARROW.value, bbox=BoundingBox(150, 80, 300, 100), element_type="arrow"),
+            XMLFragment(element_id="text_1", xml_content=label_xml, layer_level=LayerLevel.TEXT.value, bbox=BoundingBox(200, 70, 240, 90), element_type="edge_label"),
+        ]
+
+        sorted_f = merger._sort_fragments(frags)
+        root = merger._build_xml_structure(500, 500, sorted_f)
+
+        edge_cells = [c for c in root.iter("mxCell") if c.get("edge") == "1"]
+        self.assertEqual(len(edge_cells), 1)
+        edge = edge_cells[0]
+        self.assertNotIn(edge.get("source"), ["0", "1", None])
+        self.assertNotIn(edge.get("target"), ["0", "1", None])
+        all_ids = {c.get("id") for c in root.iter("mxCell")}
+        self.assertIn(edge.get("source"), all_ids)
+        self.assertIn(edge.get("target"), all_ids)
+
+        label_cells = [c for c in root.iter("mxCell") if c.get("connectable") == "0"]
+        self.assertEqual(len(label_cells), 1)
+        self.assertEqual(label_cells[0].get("parent"), edge.get("id"))
 class TestW2DetectionGaps(unittest.TestCase):
     def test_w2_cases_no_reversed_and_z_detected(self):
         cases_dir = "/Users/hilbert/work/editbanana-fastsam-integration/cases"

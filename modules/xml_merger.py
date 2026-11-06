@@ -471,16 +471,39 @@ class XMLMerger(BaseProcessor):
         # 创建基础结构
         mxfile = self._create_base_xml(canvas_width, canvas_height)
         root_elem = mxfile.find(".//root")
-        
-        # 添加各个片段，重新分配ID
         current_id = 2  # 0和1已被基础cell占用
-        
+        id_map = {}
+        cells = []
+
         for fragment in sorted_fragments:
             cell = self._parse_and_update_cell(fragment.xml_content, current_id)
             if cell is not None:
-                root_elem.append(cell)
+                old_id = str(fragment.element_id)
+                id_map[old_id] = str(current_id)
+                try:
+                    orig_cell_id = ET.fromstring(fragment.xml_content).get('id')
+                    if orig_cell_id:
+                        id_map[str(orig_cell_id)] = str(current_id)
+                except Exception:
+                    pass
+                cells.append(cell)
                 current_id += 1
-        
+
+        # 第二遍：重映射 edge 的 source/target 以及 edgeLabel 的 parent 引用
+        for cell in cells:
+            if cell.get("edge") == "1":
+                src = cell.get("source")
+                tgt = cell.get("target")
+                if src in id_map:
+                    cell.set("source", id_map[src])
+                if tgt in id_map:
+                    cell.set("target", id_map[tgt])
+            elif cell.get("connectable") == "0":
+                parent_id = cell.get("parent")
+                if parent_id in id_map:
+                    cell.set("parent", id_map[parent_id])
+            root_elem.append(cell)
+
         return mxfile
     
     def _parse_and_update_cell(self, xml_content: str, new_id: int) -> Optional[ET.Element]:
@@ -514,10 +537,9 @@ class XMLMerger(BaseProcessor):
             # 更新ID
             cell.set("id", str(new_id))
             
-            # 确保parent正确（除了特殊cell外，都应该是"1"）
-            if cell.get("parent") not in ["0"]:
+            # 确保parent正确（除了特殊cell或edgeLabel外，都应该是"1"）
+            if cell.get("connectable") != "0" and cell.get("parent") not in ["0"]:
                 cell.set("parent", "1")
-            
             return cell
             
         except ET.ParseError as e:
