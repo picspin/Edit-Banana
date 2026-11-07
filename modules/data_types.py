@@ -128,8 +128,8 @@ class ElementInfo:
     edge_parent_id: Optional[str] = None         # 作为连线标签时所属边 ID
     edge_offset: Optional[tuple] = None          # 相对连线中心 (offset_x, offset_y)
     text_content: Optional[str] = None           # 文字内容（供文本/边标签用）
+    is_rounded: bool = False                     # 连线转角是否启用圆角平滑过渡 (DrawIO rounded=1;arcSize=10)
 
-    # === 元数据 ===
     source_prompt: Optional[str] = None          # 触发此元素识别的prompt
     processing_notes: List[str] = field(default_factory=list)  # 处理过程中的备注
     def has_xml(self) -> bool:
@@ -151,6 +151,7 @@ class ElementInfo:
             'edge_offset': list(self.edge_offset) if self.edge_offset else None,
             'text_content': self.text_content,
             'has_xml': self.has_xml(),
+            'is_rounded': self.is_rounded,
             'source_prompt': self.source_prompt,
         }
     
@@ -166,6 +167,7 @@ class ElementInfo:
             polygon=data.get('polygon', []),
             layer_level=data.get('layer_level', LayerLevel.OTHER.value),
             source_prompt=data.get('source_prompt'),
+            is_rounded=data.get('is_rounded', False),
         )
 
 

@@ -563,6 +563,119 @@ def compute_obstacle_avoidance_route(from_box: List[int], to_box: List[int],
                 "lane_index": lane_index,
             }
 
+def compute_feedback_loop_route(from_box: List[int], to_box: List[int],
+                                obstacles: List[List[int]],
+                                clearance: int = 35,
+                                prefer_side: Optional[str] = None,
+                                canvas_width: Optional[int] = None,
+                                canvas_height: Optional[int] = None,
+                                margin: int = 10,
+                                text_obstacles: Optional[List[List[int]]] = None) -> Optional[Dict[str, Any]]:
+    """Compute an outer return loop route for feedback / cycle edges.
+
+    Routes around outer perimeter ports (e.g., bottom-to-bottom or top-to-top),
+    avoiding the primary forward axis and intermediate obstacles with 0 overlap.
+    """
+    fcx = (from_box[0] + from_box[2]) / 2.0
+    tcx = (to_box[0] + to_box[2]) / 2.0
+    fcy = (from_box[1] + from_box[3]) / 2.0
+    tcy = (to_box[1] + to_box[3]) / 2.0
+
+    other_obs = [o for o in obstacles if o != from_box and o != to_box]
+    valid_text_obs = []
+    for t in (text_obstacles or []):
+        if (from_box[0] <= t[0] and t[2] <= from_box[2] and from_box[1] <= t[1] and t[3] <= from_box[3]):
+            continue
+        if (to_box[0] <= t[0] and t[2] <= to_box[2] and to_box[1] <= t[1] and t[3] <= to_box[3]):
+            continue
+        valid_text_obs.append(t)
+
+    # 1. Horizontal feedback loop (from_box is downstream to the right of to_box)
+    if from_box[0] >= to_box[2] - 10:
+        span_boxes = [from_box, to_box] + [
+            o for o in other_obs
+            if o[0] >= min(to_box[0], from_box[0]) - 10 and o[2] <= max(to_box[2], from_box[2]) + 10
+        ]
+        max_y2 = max(b[3] for b in span_boxes)
+        min_y1 = min(b[1] for b in span_boxes)
+
+        bot_outer_y = int(max_y2 + clearance)
+        top_outer_y = int(min_y1 - clearance)
+
+        candidates = []
+        # Candidate 1: Bottom loop (exit bottom of from_box, enter bottom of to_box)
+        w_bot = [[int(fcx), from_box[3]], [int(fcx), bot_outer_y],
+                 [int(tcx), bot_outer_y], [int(tcx), to_box[3]]]
+        coll_bot = any(segment_box_collision(w_bot[i], w_bot[i+1], o, margin=2.0)
+                       for i in range(len(w_bot)-1) for o in other_obs)
+        text_bot = sum(1 for t in valid_text_obs if any(segment_box_collision(w_bot[i], w_bot[i+1], t, margin=1.0) for i in range(len(w_bot)-1)))
+        overflow_bot = (canvas_height is not None and bot_outer_y > canvas_height - margin)
+        candidates.append((1 if overflow_bot or coll_bot else 0, text_bot,
+                           0 if prefer_side in (None, 'bottom') else 1, w_bot, 'bottom'))
+
+        # Candidate 2: Top loop (exit top of from_box, enter top of to_box)
+        w_top = [[int(fcx), from_box[1]], [int(fcx), top_outer_y],
+                 [int(tcx), top_outer_y], [int(tcx), to_box[1]]]
+        coll_top = any(segment_box_collision(w_top[i], w_top[i+1], o, margin=2.0)
+                       for i in range(len(w_top)-1) for o in other_obs)
+        text_top = sum(1 for t in valid_text_obs if any(segment_box_collision(w_top[i], w_top[i+1], t, margin=1.0) for i in range(len(w_top)-1)))
+        overflow_top = (top_outer_y < margin)
+        candidates.append((1 if overflow_top or coll_top else 0, text_top,
+                           0 if prefer_side == 'top' else 1, w_top, 'top'))
+
+        candidates.sort(key=lambda c: (c[0], c[1], c[2]))
+        best_w = candidates[0][3]
+        return {
+            "connector_type": "feedback_loop",
+            "waypoints": best_w,
+            "bends": 2,
+            "loop_side": candidates[0][4],
+            "routing_method": "outer_loop",
+        }
+
+    # 2. Vertical feedback loop (from_box is downstream below to_box)
+    if from_box[1] >= to_box[3] - 10:
+        span_boxes = [from_box, to_box] + [
+            o for o in other_obs
+            if o[1] >= min(to_box[1], from_box[1]) - 10 and o[3] <= max(to_box[3], from_box[3]) + 10
+        ]
+        max_x2 = max(b[2] for b in span_boxes)
+        min_x1 = min(b[0] for b in span_boxes)
+
+        right_outer_x = int(max_x2 + clearance)
+        left_outer_x = int(min_x1 - clearance)
+
+        candidates = []
+        # Candidate 1: Right loop
+        w_right = [[from_box[2], int(fcy)], [right_outer_x, int(fcy)],
+                   [right_outer_x, int(tcy)], [to_box[2], int(tcy)]]
+        coll_right = any(segment_box_collision(w_right[i], w_right[i+1], o, margin=2.0)
+                         for i in range(len(w_right)-1) for o in other_obs)
+        text_right = sum(1 for t in valid_text_obs if any(segment_box_collision(w_right[i], w_right[i+1], t, margin=1.0) for i in range(len(w_right)-1)))
+        overflow_right = (canvas_width is not None and right_outer_x > canvas_width - margin)
+        candidates.append((1 if overflow_right or coll_right else 0, text_right,
+                           0 if prefer_side in (None, 'right') else 1, w_right, 'right'))
+
+        # Candidate 2: Left loop
+        w_left = [[from_box[0], int(fcy)], [left_outer_x, int(fcy)],
+                  [left_outer_x, int(tcy)], [to_box[0], int(tcy)]]
+        coll_left = any(segment_box_collision(w_left[i], w_left[i+1], o, margin=2.0)
+                        for i in range(len(w_left)-1) for o in other_obs)
+        text_left = sum(1 for t in valid_text_obs if any(segment_box_collision(w_left[i], w_left[i+1], t, margin=1.0) for i in range(len(w_left)-1)))
+        overflow_left = (left_outer_x < margin)
+        candidates.append((1 if overflow_left or coll_left else 0, text_left,
+                           0 if prefer_side == 'left' else 1, w_left, 'left'))
+
+        candidates.sort(key=lambda c: (c[0], c[1], c[2]))
+        best_w = candidates[0][3]
+        return {
+            "connector_type": "feedback_loop",
+            "waypoints": best_w,
+            "bends": 2,
+            "loop_side": candidates[0][4],
+            "routing_method": "outer_loop",
+        }
+
     return None
 
 
@@ -981,12 +1094,25 @@ class DetectionContourExtractor:
                     for m in re.finditer(r'<mxGeometry\s+[^>]*?x="([\d.]+)"\s+y="([\d.]+)"\s+width="([\d.]+)"\s+height="([\d.]+)"', txml):
                         x, y, w, h = float(m.group(1)), float(m.group(2)), float(m.group(3)), float(m.group(4))
                         text_obstacles.append([int(x), int(y), int(x + w), int(y + h)])
+        # Check bidirectional / feedback loops
+        feedback_arrow_indices = set()
+        for idx1, a1 in enumerate(result["arrows"]):
+            fb1, tb1 = a1["from_box"], a1["to_box"]
+            for idx2, a2 in enumerate(result["arrows"]):
+                if idx1 == idx2:
+                    continue
+                fb2, tb2 = a2["from_box"], a2["to_box"]
+                if fb1 == tb2 and tb1 == fb2:
+                    fcx1, fcy1 = (fb1[0] + fb1[2]) / 2, (fb1[1] + fb1[3]) / 2
+                    tcx1, tcy1 = (tb1[0] + tb1[2]) / 2, (tb1[1] + tb1[3]) / 2
+                    if (fcx1 > tcx1 + 20) or (abs(fcx1 - tcx1) <= 20 and fcy1 > tcy1 + 20):
+                        feedback_arrow_indices.add(idx1)
 
         obstacle_lane_counts: Dict[Any, int] = {}
         for j, a in enumerate(result["arrows"]):
             fb = a["from_box"]
             tb = a["to_box"]
-            if a.get("connector_type") in {"elbow", "obstacle_avoidance"} and a.get("waypoints"):
+            if a.get("connector_type") in {"elbow", "obstacle_avoidance", "feedback_loop"} and a.get("waypoints"):
                 wpts = a["waypoints"]
                 abox = [min(p[0] for p in wpts), min(p[1] for p in wpts),
                         max(p[0] for p in wpts), max(p[1] for p in wpts)]
@@ -994,6 +1120,30 @@ class DetectionContourExtractor:
                 arrow_start = tuple(wpts[0])
                 arrow_end = tuple(wpts[-1])
                 vector_points = wpts[1:-1]
+            elif j in feedback_arrow_indices or a.get("is_feedback") or a.get("connector_type") == "feedback_loop":
+                fb_route = compute_feedback_loop_route(
+                    fb, tb, shapes_bboxes,
+                    canvas_width=canvas_width, canvas_height=canvas_height,
+                    text_obstacles=text_obstacles
+                )
+                if fb_route:
+                    wpts = fb_route["waypoints"]
+                    abox = [min(p[0] for p in wpts), min(p[1] for p in wpts),
+                            max(p[0] for p in wpts), max(p[1] for p in wpts)]
+                    poly = wpts
+                    arrow_start = tuple(wpts[0])
+                    arrow_end = tuple(wpts[-1])
+                    vector_points = wpts[1:-1]
+                    a["connector_type"] = "feedback_loop"
+                    a["waypoints"] = wpts
+                    a["bends"] = fb_route["bends"]
+                    a["loop_side"] = fb_route["loop_side"]
+                else:
+                    abox = [min(fb[0], tb[0]), min(fb[1], tb[1]), max(fb[2], tb[2]), max(fb[3], tb[3])]
+                    arrow_start = ((fb[0] + fb[2]) // 2, (fb[1] + fb[3]) // 2)
+                    arrow_end = ((tb[0] + tb[2]) // 2, (tb[1] + tb[3]) // 2)
+                    poly = []
+                    vector_points = []
             else:
                 detour = compute_obstacle_avoidance_route(
                     fb, tb, shapes_bboxes,
@@ -1051,6 +1201,7 @@ class DetectionContourExtractor:
                     source_id = str(s_idx)
                 if sb["bbox"] == a["to_box"]:
                     target_id = str(s_idx)
+            is_rounded = bool(vector_points and len(vector_points) >= 1)
             elements.append(ElementInfo(
                 id=len(elements), element_type="arrow",
                 bbox=BoundingBox(x1=x1, y1=y1, x2=x2, y2=y2),
@@ -1061,6 +1212,7 @@ class DetectionContourExtractor:
                 vector_points=vector_points,
                 source_id=source_id,
                 target_id=target_id,
+                is_rounded=is_rounded,
             ))
         # FastSAM arrow instances: a mask that spans the same gap
         # as a shaft-confirmed arrow CONFIRMS that arrow as an
@@ -1112,7 +1264,7 @@ class DetectionContourExtractor:
                 "arrows_head_separated": sum(1 for a in result["arrows"] if a.get("head_separated")),
                 "arrows_elbow": sum(1 for a in result["arrows"] if a.get("connector_type") == "elbow"),
                 "arrows_obstacle_avoided": sum(1 for a in result["arrows"] if a.get("connector_type") == "obstacle_avoidance"),
-                "yolo_kept": len(result.get("yolo_kept", [])),
+                "arrows_feedback_loop": sum(1 for a in result["arrows"] if a.get("connector_type") == "feedback_loop"),
                 "yolo_available": result.get("yolo_available", False),
                 "yolo_error": result.get("yolo_error"),
                 "fastsam_masks": len(result.get("fastsam_masks", [])),

@@ -22,6 +22,7 @@ from modules.fastsam_detection import (
 from modules.detection_contours import (
     DetectionContourExtractor,
     bind_edge_label_to_arrow,
+    compute_feedback_loop_route,
     compute_obstacle_avoidance_route,
     detect_arrow_shafts,
     detect_elbow_connectors,
@@ -30,7 +31,7 @@ from modules.detection_contours import (
     segment_box_collision,
 )
 from modules.xml_merger import XMLMerger, XMLFragment
-from modules.data_types import LayerLevel, BoundingBox
+from modules.data_types import LayerLevel, BoundingBox, ElementInfo
 
 SYNTH = "/Users/hilbert/work/editbanana-real-test/images/synth_flow.png"
 SINGLE = "/Users/hilbert/work/editbanana-round2/generated/single-chain.png"
@@ -689,5 +690,110 @@ class TestObstacleAvoidance(unittest.TestCase):
             self.assertGreaterEqual(arrow_elem.vector_points[1][1], 345)
         finally:
             ex.extract = original_extract
+
+    def test_compute_feedback_loop_route_horizontal(self):
+        box_a = [50, 100, 150, 200]
+        box_b = [450, 100, 550, 200]
+        route = compute_feedback_loop_route(box_b, box_a, [box_a, box_b], clearance=35)
+        self.assertIsNotNone(route)
+        self.assertEqual(route["connector_type"], "feedback_loop")
+        self.assertEqual(route["bends"], 2)
+        self.assertEqual(route["loop_side"], "bottom")
+        self.assertEqual(route["waypoints"], [[500, 200], [500, 235], [100, 235], [100, 200]])
+        # Waypoints clear both box interiors
+        for i in range(len(route["waypoints"]) - 1):
+            p1, p2 = route["waypoints"][i], route["waypoints"][i+1]
+            self.assertFalse(segment_box_collision(p1, p2, box_a, margin=0))
+            self.assertFalse(segment_box_collision(p1, p2, box_b, margin=0))
+
+    def test_compute_feedback_loop_route_vertical(self):
+        box_a = [100, 50, 200, 150]
+        box_b = [100, 450, 200, 550]
+        route = compute_feedback_loop_route(box_b, box_a, [box_a, box_b], clearance=35)
+        self.assertIsNotNone(route)
+        self.assertEqual(route["connector_type"], "feedback_loop")
+        self.assertEqual(route["bends"], 2)
+        self.assertEqual(route["loop_side"], "right")
+        self.assertEqual(route["waypoints"], [[200, 500], [235, 500], [235, 100], [200, 100]])
+
+    def test_process_detects_bidirectional_feedback_loop(self):
+        ex = DetectionContourExtractor(fastsam_model_path="")
+        box_a = [50, 100, 150, 200]
+        box_b = [450, 100, 550, 200]
+        shapes = [{"bbox": box_a}, {"bbox": box_b}]
+        # Bidirectional arrows: A->B and B->A
+        arrows = [
+            {"from_box": box_a, "to_box": box_b, "shaft_confirmed": True, "head_separated": False, "method": "test"},
+            {"from_box": box_b, "to_box": box_a, "shaft_confirmed": True, "head_separated": False, "method": "test"},
+        ]
+        class Ctx:
+            def __init__(self):
+                self.image_path = SYNTH
+                self.elements = []
+                self.canvas_width = 600
+                self.canvas_height = 500
+                self.intermediate_results = {}
+        ctx = Ctx()
+        original_extract = ex.extract
+        ex.extract = lambda path, **kwargs: {
+            "canvas_width": 600, "canvas_height": 500,
+            "shapes": shapes, "arrows": arrows,
+            "yolo_boxes": [], "yolo_kept": [],
+            "yolo_available": False, "yolo_error": None, "yolo_model": None,
+            "fastsam_masks": [], "fastsam_arrow_instances": [],
+            "fastsam_shapes_kept": [], "fastsam_shapes_dropped": [],
+            "fastsam_available": False, "fastsam_error": None, "fastsam_model": None,
+        }
+        try:
+            res = ex.process(ctx)
+            self.assertEqual(res.metadata["arrows_feedback_loop"], 1)
+            arrow_elems = [e for e in ctx.elements if e.element_type == "arrow"]
+            self.assertEqual(len(arrow_elems), 2)
+            # Forward arrow
+            self.assertEqual(arrow_elems[0].source_id, "0")
+            self.assertEqual(arrow_elems[0].target_id, "1")
+            # Feedback arrow has waypoints routing underneath
+            self.assertEqual(arrow_elems[1].source_id, "1")
+            self.assertEqual(arrow_elems[1].target_id, "0")
+            self.assertIsNotNone(arrow_elems[1].vector_points)
+            self.assertTrue(arrow_elems[1].is_rounded)
+            self.assertEqual(arrow_elems[1].vector_points, [[500, 235], [100, 235]])
+        finally:
+            ex.extract = original_extract
+
+    def test_drawio_xml_rounded_corners_for_multibend_connectors(self):
+        import types
+        if "yaml" not in sys.modules:
+            sys.modules["yaml"] = types.ModuleType("yaml")
+        from main import Pipeline
+        pipeline = Pipeline.__new__(Pipeline)
+        class Ctx:
+            def __init__(self):
+                self.elements = [
+                    # Multi-bend arrow with waypoints
+                    ElementInfo(
+                        id=0, element_type="arrow",
+                        bbox=BoundingBox(50, 100, 550, 235),
+                        arrow_start=(500, 200), arrow_end=(100, 200),
+                        vector_points=[[500, 235], [100, 235]],
+                        source_id="1", target_id="0", is_rounded=True,
+                    ),
+                    # Straight arrow
+                    ElementInfo(
+                        id=1, element_type="arrow",
+                        bbox=BoundingBox(150, 150, 450, 150),
+                        arrow_start=(150, 150), arrow_end=(450, 150),
+                        vector_points=[],
+                        source_id="0", target_id="1", is_rounded=False,
+                    ),
+                ]
+        ctx = Ctx()
+        pipeline._generate_xml_fragments(ctx)
+        # Multi-bend connector has rounded=1;arcSize=10;
+        self.assertIn("rounded=1;arcSize=10;", ctx.elements[0].xml_fragment)
+        # Straight connector has rounded=0;
+        self.assertIn("rounded=0;", ctx.elements[1].xml_fragment)
+
+
 if __name__ == "__main__":
     unittest.main()
