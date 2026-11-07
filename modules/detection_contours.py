@@ -56,6 +56,7 @@ import heapq
 import itertools
 import math
 import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
@@ -188,12 +189,19 @@ def segment_box_collision(p1: Tuple[float, float], p2: Tuple[float, float],
 
 def hanan_grid_route(start_pt: Tuple[int, int], end_pt: Tuple[int, int],
                      obstacles: List[List[int]], clearance: int = 25,
-                     bend_penalty: int = 80) -> Optional[List[List[int]]]:
+                     bend_penalty: int = 80,
+                     canvas_width: Optional[int] = None,
+                     canvas_height: Optional[int] = None,
+                     margin: int = 10,
+                     text_obstacles: Optional[List[List[int]]] = None,
+                     text_clearance: int = 12,
+                     text_penalty: int = 1000) -> Optional[List[List[int]]]:
     """Find shortest orthogonal collision-free path with minimal bends on Hanan grid.
 
     Hanan grid uses orthogonal lines through terminals and obstacle boundaries.
     Edge collisions with any obstacle box interior are pruned using Liang-Barsky.
-    A* cost = Manhattan distance + bend_penalty * (direction changes).
+    Supports canvas bounds clamping/margin protection and soft text obstacle penalty.
+    A* cost = Manhattan distance + bend_penalty * (direction changes) + soft_penalties.
     """
     xs = {int(start_pt[0]), int(end_pt[0])}
     ys = {int(start_pt[1]), int(end_pt[1])}
@@ -203,14 +211,30 @@ def hanan_grid_route(start_pt: Tuple[int, int], end_pt: Tuple[int, int],
         ys.add(int(o[1] - clearance))
         ys.add(int(o[3] + clearance))
 
+    for t in (text_obstacles or []):
+        xs.add(int(t[0] - text_clearance))
+        xs.add(int(t[2] + text_clearance))
+        ys.add(int(t[1] - text_clearance))
+        ys.add(int(t[3] + text_clearance))
+
+    if canvas_width is not None:
+        xs = {max(margin, min(canvas_width - margin, x)) for x in xs}
+    if canvas_height is not None:
+        ys = {max(margin, min(canvas_height - margin, y)) for y in ys}
+
     sorted_x = sorted(list(xs))
     sorted_y = sorted(list(ys))
 
     x_map = {x: i for i, x in enumerate(sorted_x)}
     y_map = {y: i for i, y in enumerate(sorted_y)}
 
-    start_node = (x_map[int(start_pt[0])], y_map[int(start_pt[1])])
-    target_node = (x_map[int(end_pt[0])], y_map[int(end_pt[1])])
+    sx = min(sorted_x, key=lambda x: abs(x - start_pt[0]))
+    sy = min(sorted_y, key=lambda y: abs(y - start_pt[1]))
+    ex = min(sorted_x, key=lambda x: abs(x - end_pt[0]))
+    ey = min(sorted_y, key=lambda y: abs(y - end_pt[1]))
+
+    start_node = (x_map[sx], y_map[sy])
+    target_node = (x_map[ex], y_map[ey])
 
     counter = itertools.count()
     pq = [(0, 0, next(counter), start_node[0], start_node[1], 0, [[int(start_pt[0]), int(start_pt[1])]])]
@@ -234,6 +258,8 @@ def hanan_grid_route(start_pt: Tuple[int, int], end_pt: Tuple[int, int],
                         simplified[-1] = pt
                         continue
                 simplified.append(pt)
+            if simplified[-1] != [int(end_pt[0]), int(end_pt[1])]:
+                simplified.append([int(end_pt[0]), int(end_pt[1])])
             return simplified
 
         neighbors = []
@@ -249,7 +275,13 @@ def hanan_grid_route(start_pt: Tuple[int, int], end_pt: Tuple[int, int],
                 continue
             seg_dist = abs(nxt_pt[0] - curr_pt[0]) + abs(nxt_pt[1] - curr_pt[1])
             turn_cost = bend_penalty if (prev_dir != 0 and prev_dir != n_dir) else 0
-            n_cost = cost + seg_dist + turn_cost
+
+            t_penalty = 0
+            if text_obstacles:
+                t_collides = sum(1 for t in text_obstacles if segment_box_collision(curr_pt, nxt_pt, t, margin=1.0))
+                t_penalty = t_collides * text_penalty
+
+            n_cost = cost + seg_dist + turn_cost + t_penalty
             h = abs(nxt_pt[0] - end_pt[0]) + abs(nxt_pt[1] - end_pt[1])
             heapq.heappush(pq, (n_cost + h, n_cost, next(counter), n_xi, n_yi, n_dir, path + [[nxt_pt[0], nxt_pt[1]]]))
 
@@ -260,11 +292,15 @@ def compute_obstacle_avoidance_route(from_box: List[int], to_box: List[int],
                                      obstacles: List[List[int]],
                                      clearance: int = 25,
                                      lane_index: int = 0,
-                                     lane_spacing: int = 15) -> Optional[Dict[str, Any]]:
+                                     lane_spacing: int = 15,
+                                     canvas_width: Optional[int] = None,
+                                     canvas_height: Optional[int] = None,
+                                     margin: int = 10,
+                                     text_obstacles: Optional[List[List[int]]] = None) -> Optional[Dict[str, Any]]:
     """Compute orthogonal detour waypoints routing around intermediate obstacle boxes.
 
-    Supports lane offset allocation (channel separation) and falls back to Hanan-grid
-    A* routing when multi-obstacle mazes or blocking obstacles prevent simple 4-bend detour.
+    Supports lane offset allocation (channel separation), canvas bounds clamping/overflow protection,
+    text/label soft obstacle avoidance, and falls back to Hanan-grid A* routing when needed.
     Returns dict with waypoints, bends count, obstacles_avoided list, routing_method, and lane_index.
     """
     effective_clearance = clearance + lane_index * lane_spacing
@@ -272,6 +308,14 @@ def compute_obstacle_avoidance_route(from_box: List[int], to_box: List[int],
     tcx, tcy = (to_box[0] + to_box[2]) / 2.0, (to_box[1] + to_box[3]) / 2.0
 
     other_obs = [o for o in obstacles if o != from_box and o != to_box]
+
+    valid_text_obs = []
+    for t in (text_obstacles or []):
+        if (from_box[0] <= t[0] and t[2] <= from_box[2] and from_box[1] <= t[1] and t[3] <= from_box[3]):
+            continue
+        if (to_box[0] <= t[0] and t[2] <= to_box[2] and to_box[1] <= t[1] and t[3] <= to_box[3]):
+            continue
+        valid_text_obs.append(t)
 
     # 1. Horizontal span (left -> right or right -> left)
     if abs(fcy - tcy) <= 40 and (from_box[2] < to_box[0] or to_box[2] < from_box[0]):
@@ -293,36 +337,87 @@ def compute_obstacle_avoidance_route(from_box: List[int], to_box: List[int],
             turn1_x = int((lx2 + min_ox1) / 2)
             turn2_x = int((max_ox2 + rx1) / 2)
 
-            top_y = int(min_oy1 - effective_clearance)
-            bot_y = int(max_oy2 + effective_clearance)
+            raw_top_y = int(min_oy1 - effective_clearance)
+            raw_bot_y = int(max_oy2 + effective_clearance)
 
             candidates = []
-            for detour_y in [top_y, bot_y]:
+            for raw_y, is_top in [(raw_top_y, True), (raw_bot_y, False)]:
+                detour_y = raw_y
+                overflow = False
+                if canvas_height is not None:
+                    if detour_y < margin:
+                        overflow = True
+                        detour_y = margin
+                    elif detour_y > canvas_height - margin:
+                        overflow = True
+                        detour_y = canvas_height - margin
+                elif detour_y < margin:
+                    overflow = True
+                    detour_y = margin
+
                 if is_forward:
                     w = [[lx2, y_level], [turn1_x, y_level], [turn1_x, detour_y],
                          [turn2_x, detour_y], [turn2_x, y_level], [rx1, y_level]]
                 else:
                     w = [[rx1, y_level], [turn2_x, y_level], [turn2_x, detour_y],
                          [turn1_x, detour_y], [turn1_x, y_level], [lx2, y_level]]
+
                 collides = any(segment_box_collision(w[i], w[i+1], o, margin=2.0)
                                for i in range(len(w) - 1) for o in other_obs)
                 if not collides:
-                    candidates.append((abs(y_level - detour_y), w))
+                    text_colls = sum(1 for t in valid_text_obs
+                                     if any(segment_box_collision(w[i], w[i+1], t, margin=1.0)
+                                            for i in range(len(w) - 1)))
+                    overflow_pen = 1 if overflow else 0
+                    candidates.append((overflow_pen, text_colls, abs(y_level - detour_y), w))
 
             if candidates:
-                candidates.sort(key=lambda c: c[0])
-                best_w = candidates[0][1]
+                candidates.sort(key=lambda c: (c[0], c[1], c[2]))
+                best = candidates[0]
+                if best[0] == 0 and best[1] == 0:
+                    return {
+                        "connector_type": "obstacle_avoidance",
+                        "waypoints": best[3],
+                        "bends": 4,
+                        "obstacles_avoided": intervening,
+                        "routing_method": "orthogonal_detour",
+                        "lane_index": lane_index,
+                    }
+                elif not any(c[0] == 0 and c[1] == 0 for c in candidates):
+                    start_pt = (lx2, y_level) if is_forward else (rx1, y_level)
+                    end_pt = (rx1, y_level) if is_forward else (lx2, y_level)
+                    hanan_w = hanan_grid_route(start_pt, end_pt, other_obs,
+                                               clearance=effective_clearance,
+                                               canvas_width=canvas_width,
+                                               canvas_height=canvas_height,
+                                               margin=margin,
+                                               text_obstacles=valid_text_obs)
+                    if hanan_w:
+                        return {
+                            "connector_type": "obstacle_avoidance",
+                            "waypoints": hanan_w,
+                            "bends": max(0, len(hanan_w) - 2),
+                            "obstacles_avoided": intervening,
+                            "routing_method": "hanan_grid_astar",
+                            "lane_index": lane_index,
+                        }
                 return {
                     "connector_type": "obstacle_avoidance",
-                    "waypoints": best_w,
+                    "waypoints": best[3],
                     "bends": 4,
                     "obstacles_avoided": intervening,
                     "routing_method": "orthogonal_detour",
                     "lane_index": lane_index,
                 }
+
             start_pt = (lx2, y_level) if is_forward else (rx1, y_level)
             end_pt = (rx1, y_level) if is_forward else (lx2, y_level)
-            hanan_w = hanan_grid_route(start_pt, end_pt, other_obs, clearance=effective_clearance)
+            hanan_w = hanan_grid_route(start_pt, end_pt, other_obs,
+                                       clearance=effective_clearance,
+                                       canvas_width=canvas_width,
+                                       canvas_height=canvas_height,
+                                       margin=margin,
+                                       text_obstacles=valid_text_obs)
             if hanan_w:
                 return {
                     "connector_type": "obstacle_avoidance",
@@ -353,36 +448,87 @@ def compute_obstacle_avoidance_route(from_box: List[int], to_box: List[int],
             turn1_y = int((ty2 + min_oy1) / 2)
             turn2_y = int((max_oy2 + by1) / 2)
 
-            left_x = int(min_ox1 - effective_clearance)
-            right_x = int(max_ox2 + effective_clearance)
+            raw_left_x = int(min_ox1 - effective_clearance)
+            raw_right_x = int(max_ox2 + effective_clearance)
 
             candidates = []
-            for detour_x in [left_x, right_x]:
+            for raw_x, is_left in [(raw_left_x, True), (raw_right_x, False)]:
+                detour_x = raw_x
+                overflow = False
+                if canvas_width is not None:
+                    if detour_x < margin:
+                        overflow = True
+                        detour_x = margin
+                    elif detour_x > canvas_width - margin:
+                        overflow = True
+                        detour_x = canvas_width - margin
+                elif detour_x < margin:
+                    overflow = True
+                    detour_x = margin
+
                 if is_down:
                     w = [[x_level, ty2], [x_level, turn1_y], [detour_x, turn1_y],
                          [detour_x, turn2_y], [x_level, turn2_y], [x_level, by1]]
                 else:
                     w = [[x_level, by1], [x_level, turn2_y], [detour_x, turn2_y],
                          [detour_x, turn1_y], [x_level, turn1_y], [x_level, ty2]]
+
                 collides = any(segment_box_collision(w[i], w[i+1], o, margin=2.0)
                                for i in range(len(w) - 1) for o in other_obs)
                 if not collides:
-                    candidates.append((abs(x_level - detour_x), w))
+                    text_colls = sum(1 for t in valid_text_obs
+                                     if any(segment_box_collision(w[i], w[i+1], t, margin=1.0)
+                                            for i in range(len(w) - 1)))
+                    overflow_pen = 1 if overflow else 0
+                    candidates.append((overflow_pen, text_colls, abs(x_level - detour_x), w))
 
             if candidates:
-                candidates.sort(key=lambda c: c[0])
-                best_w = candidates[0][1]
+                candidates.sort(key=lambda c: (c[0], c[1], c[2]))
+                best = candidates[0]
+                if best[0] == 0 and best[1] == 0:
+                    return {
+                        "connector_type": "obstacle_avoidance",
+                        "waypoints": best[3],
+                        "bends": 4,
+                        "obstacles_avoided": intervening,
+                        "routing_method": "orthogonal_detour",
+                        "lane_index": lane_index,
+                    }
+                elif not any(c[0] == 0 and c[1] == 0 for c in candidates):
+                    start_pt = (x_level, ty2) if is_down else (x_level, by1)
+                    end_pt = (x_level, by1) if is_down else (x_level, ty2)
+                    hanan_w = hanan_grid_route(start_pt, end_pt, other_obs,
+                                               clearance=effective_clearance,
+                                               canvas_width=canvas_width,
+                                               canvas_height=canvas_height,
+                                               margin=margin,
+                                               text_obstacles=valid_text_obs)
+                    if hanan_w:
+                        return {
+                            "connector_type": "obstacle_avoidance",
+                            "waypoints": hanan_w,
+                            "bends": max(0, len(hanan_w) - 2),
+                            "obstacles_avoided": intervening,
+                            "routing_method": "hanan_grid_astar",
+                            "lane_index": lane_index,
+                        }
                 return {
                     "connector_type": "obstacle_avoidance",
-                    "waypoints": best_w,
+                    "waypoints": best[3],
                     "bends": 4,
                     "obstacles_avoided": intervening,
                     "routing_method": "orthogonal_detour",
                     "lane_index": lane_index,
                 }
+
             start_pt = (x_level, ty2) if is_down else (x_level, by1)
             end_pt = (x_level, by1) if is_down else (x_level, ty2)
-            hanan_w = hanan_grid_route(start_pt, end_pt, other_obs, clearance=effective_clearance)
+            hanan_w = hanan_grid_route(start_pt, end_pt, other_obs,
+                                       clearance=effective_clearance,
+                                       canvas_width=canvas_width,
+                                       canvas_height=canvas_height,
+                                       margin=margin,
+                                       text_obstacles=valid_text_obs)
             if hanan_w:
                 return {
                     "connector_type": "obstacle_avoidance",
@@ -399,8 +545,14 @@ def compute_obstacle_avoidance_route(from_box: List[int], to_box: List[int],
     en_x = to_box[2] if tcx < fcx else to_box[0]
     en_y = to_box[3] if tcy < fcy else to_box[1]
     direct_colliding = [o for o in other_obs if segment_box_collision((ex_x, ex_y), (en_x, en_y), o, margin=2.0)]
-    if direct_colliding:
-        hanan_w = hanan_grid_route((ex_x, ex_y), (en_x, en_y), other_obs, clearance=effective_clearance)
+    direct_text_colliding = [t for t in valid_text_obs if segment_box_collision((ex_x, ex_y), (en_x, en_y), t, margin=1.0)]
+    if direct_colliding or direct_text_colliding:
+        hanan_w = hanan_grid_route((ex_x, ex_y), (en_x, en_y), other_obs,
+                                   clearance=effective_clearance,
+                                   canvas_width=canvas_width,
+                                   canvas_height=canvas_height,
+                                   margin=margin,
+                                   text_obstacles=valid_text_obs)
         if hanan_w:
             return {
                 "connector_type": "obstacle_avoidance",
@@ -809,6 +961,27 @@ class DetectionContourExtractor:
                 score=1.0, polygon=[[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
             ))
         shapes_bboxes = [b["bbox"] for b in result["shapes"]]
+        canvas_width = result.get("canvas_width")
+        canvas_height = result.get("canvas_height")
+
+        # Collect text obstacles for soft obstacle avoidance
+        text_obstacles: List[List[int]] = []
+        for elem in getattr(context, "elements", []):
+            if getattr(elem, "element_type", "") in {"text", "edge_label"} and getattr(elem, "bbox", None):
+                b = elem.bbox
+                text_obstacles.append([int(b.x1), int(b.y1), int(b.x2), int(b.y2)])
+        if hasattr(context, "intermediate_results") and isinstance(context.intermediate_results, dict):
+            for k in ("text_boxes", "ocr_boxes"):
+                for b in context.intermediate_results.get(k, []):
+                    if isinstance(b, (list, tuple)) and len(b) >= 4:
+                        text_obstacles.append([int(b[0]), int(b[1]), int(b[2]), int(b[3])])
+            if "text_xml" in context.intermediate_results:
+                txml = context.intermediate_results["text_xml"]
+                if isinstance(txml, str):
+                    for m in re.finditer(r'<mxGeometry\s+[^>]*?x="([\d.]+)"\s+y="([\d.]+)"\s+width="([\d.]+)"\s+height="([\d.]+)"', txml):
+                        x, y, w, h = float(m.group(1)), float(m.group(2)), float(m.group(3)), float(m.group(4))
+                        text_obstacles.append([int(x), int(y), int(x + w), int(y + h)])
+
         obstacle_lane_counts: Dict[Any, int] = {}
         for j, a in enumerate(result["arrows"]):
             fb = a["from_box"]
@@ -822,13 +995,21 @@ class DetectionContourExtractor:
                 arrow_end = tuple(wpts[-1])
                 vector_points = wpts[1:-1]
             else:
-                detour = compute_obstacle_avoidance_route(fb, tb, shapes_bboxes)
+                detour = compute_obstacle_avoidance_route(
+                    fb, tb, shapes_bboxes,
+                    canvas_width=canvas_width, canvas_height=canvas_height,
+                    text_obstacles=text_obstacles
+                )
                 if detour:
                     obs_key = tuple(sorted((o[0], o[1], o[2], o[3]) for o in detour["obstacles_avoided"]))
                     lane_idx = obstacle_lane_counts.get(obs_key, 0)
                     obstacle_lane_counts[obs_key] = lane_idx + 1
                     if lane_idx > 0:
-                        detour = compute_obstacle_avoidance_route(fb, tb, shapes_bboxes, lane_index=lane_idx) or detour
+                        detour = compute_obstacle_avoidance_route(
+                            fb, tb, shapes_bboxes, lane_index=lane_idx,
+                            canvas_width=canvas_width, canvas_height=canvas_height,
+                            text_obstacles=text_obstacles
+                        ) or detour
                     wpts = detour["waypoints"]
                     abox = [min(p[0] for p in wpts), min(p[1] for p in wpts),
                             max(p[0] for p in wpts), max(p[1] for p in wpts)]

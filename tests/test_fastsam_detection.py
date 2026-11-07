@@ -575,6 +575,119 @@ class TestObstacleAvoidance(unittest.TestCase):
         finally:
             ex.extract = original_extract
 
+    def test_canvas_bounds_top_overflow_selects_bottom(self):
+        # Box O near top edge y=10, canvas_height=500, margin=10
+        # Top detour (10 - 25 = -15 < margin) overflows, so bottom detour (150 + 25 = 175) is selected
+        box_a = [50, 60, 150, 140]
+        box_b = [450, 60, 550, 140]
+        box_o = [250, 10, 350, 150]
+        route = compute_obstacle_avoidance_route(
+            box_a, box_b, [box_o], clearance=25,
+            canvas_width=600, canvas_height=500, margin=10
+        )
+        self.assertIsNotNone(route)
+        wpts = route["waypoints"]
+        # All waypoints must be strictly within canvas bounds [10, 490]
+        for p in wpts:
+            self.assertGreaterEqual(p[1], 10)
+            self.assertLessEqual(p[1], 490)
+        # Detour y must be bottom detour
+        self.assertEqual(wpts[2][1], 175)
 
+    def test_canvas_bounds_bottom_overflow_selects_top(self):
+        # Box O near bottom edge y=480, canvas_height=500, margin=10
+        # Bottom detour (480 + 25 = 505 > 490) overflows, so top detour is selected
+        box_a = [50, 360, 150, 440]
+        box_b = [450, 360, 550, 440]
+        box_o = [250, 350, 350, 480]
+        route = compute_obstacle_avoidance_route(
+            box_a, box_b, [box_o], clearance=25,
+            canvas_width=600, canvas_height=500, margin=10
+        )
+        self.assertIsNotNone(route)
+        wpts = route["waypoints"]
+        for p in wpts:
+            self.assertGreaterEqual(p[1], 10)
+            self.assertLessEqual(p[1], 490)
+        # Detour y must be top detour (350 - 25 = 325)
+        self.assertEqual(wpts[2][1], 325)
+
+    def test_text_obstacle_avoidance_switches_detour_side(self):
+        box_a = [50, 200, 150, 300]
+        box_b = [450, 200, 550, 300]
+        box_o = [250, 180, 350, 320]
+        # Text label sitting right on the top detour path y=155
+        box_text = [220, 130, 380, 170]
+        route = compute_obstacle_avoidance_route(
+            box_a, box_b, [box_o], clearance=25,
+            text_obstacles=[box_text]
+        )
+        self.assertIsNotNone(route)
+        wpts = route["waypoints"]
+        # Should choose bottom detour y=345 to avoid piercing text box
+        self.assertEqual(wpts[2][1], 345)
+        for i in range(len(wpts) - 1):
+            self.assertFalse(segment_box_collision(wpts[i], wpts[i+1], box_text, margin=1.0))
+
+    def test_hanan_grid_astar_soft_text_avoidance(self):
+        box_o = [250, 180, 350, 320]
+        # Text label blocking top path
+        text_top = [220, 130, 380, 170]
+        wpts = hanan_grid_route(
+            (150, 250), (450, 250), [box_o], clearance=25,
+            text_obstacles=[text_top]
+        )
+        self.assertIsNotNone(wpts)
+        # Hanan A* selects bottom path y=345
+        self.assertEqual(wpts[1][1], 345)
+        for i in range(len(wpts) - 1):
+            self.assertFalse(segment_box_collision(wpts[i], wpts[i+1], text_top, margin=1.0))
+            self.assertFalse(segment_box_collision(wpts[i], wpts[i+1], box_o, margin=0))
+
+    def test_process_with_text_xml_extracts_and_avoids_labels(self):
+        ex = DetectionContourExtractor(fastsam_model_path="")
+        box_a = [50, 200, 150, 300]
+        box_o = [250, 180, 350, 320]
+        box_b = [450, 200, 550, 300]
+        shapes = [{"bbox": box_a}, {"bbox": box_o}, {"bbox": box_b}]
+        arrows = [{
+            "from_box": box_a, "to_box": box_b,
+            "shaft_confirmed": True, "head_separated": False, "method": "test"
+        }]
+        text_xml = '''
+        <mxGraphModel>
+          <root>
+            <mxCell id="10" value="Top Status Label" vertex="1">
+              <mxGeometry x="220" y="130" width="160" height="40" as="geometry"/>
+            </mxCell>
+          </root>
+        </mxGraphModel>
+        '''
+        class Ctx:
+            def __init__(self):
+                self.image_path = SYNTH
+                self.elements = []
+                self.canvas_width = 600
+                self.canvas_height = 500
+                self.intermediate_results = {"text_xml": text_xml}
+        ctx = Ctx()
+        original_extract = ex.extract
+        ex.extract = lambda path, **kwargs: {
+            "canvas_width": 600, "canvas_height": 500,
+            "shapes": shapes, "arrows": arrows,
+            "yolo_boxes": [], "yolo_kept": [],
+            "yolo_available": False, "yolo_error": None, "yolo_model": None,
+            "fastsam_masks": [], "fastsam_arrow_instances": [],
+            "fastsam_shapes_kept": [], "fastsam_shapes_dropped": [],
+            "fastsam_available": False, "fastsam_error": None, "fastsam_model": None,
+        }
+        try:
+            res = ex.process(ctx)
+            self.assertEqual(res.metadata["arrows_obstacle_avoided"], 1)
+            arrow_elem = [e for e in ctx.elements if e.element_type == "arrow"][0]
+            # Must route around bottom to avoid the text label at y in [130, 170]
+            self.assertGreaterEqual(arrow_elem.vector_points[1][1], 345)
+        finally:
+            ex.extract = original_extract
 if __name__ == "__main__":
     unittest.main()
