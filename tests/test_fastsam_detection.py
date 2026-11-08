@@ -795,5 +795,90 @@ class TestObstacleAvoidance(unittest.TestCase):
         self.assertIn("rounded=0;", ctx.elements[1].xml_fragment)
 
 
+class TestHananCanvasClampRegression(unittest.TestCase):
+    """Regressions for the canvas-clamp / A*-endpoint fixes (Major 1-3).
+
+    These pin the three reproduced defects in hanan_grid_route: a clamped
+    terminal could lose a route (M1), mix raw and snapped coordinates into
+    a non-orthogonal segment (M2), or append an end point that pierced an
+    obstacle (M3). Each test asserts the invariant, not just one output.
+    """
+
+    @staticmethod
+    def _orthogonal(waypoints):
+        return all(p[0] == q[0] or p[1] == q[1]
+                   for p, q in zip(waypoints, waypoints[1:]))
+
+    @staticmethod
+    def _collisions(waypoints, obstacles, margin=0.0):
+        return [(p, q, o) for p, q in zip(waypoints, waypoints[1:])
+                for o in obstacles
+                if segment_box_collision(p, q, o, margin=margin)]
+
+    def test_m1_clamped_terminal_does_not_lose_route(self):
+        # Terminal y=4 would clamp to margin y=10, inside obstacle y[7,64].
+        obstacles = [[0, 7, 126, 64]]
+        route = hanan_grid_route((83, 4), (525, 127), obstacles,
+                                 canvas_width=600, canvas_height=500, margin=10)
+        self.assertIsNotNone(
+            route, "canvas clamp must not drop a route that exists on-canvas")
+        self.assertEqual(route[0], [83, 4])
+        self.assertEqual(route[-1], [525, 127])
+        self.assertEqual(self._collisions(route, obstacles), [])
+
+    def test_m2_no_diagonal_segment_from_clamped_terminal(self):
+        # Terminal x=2 is inside the margin band; the grid snaps it inward.
+        obstacles = [[300, 300, 500, 500]]
+        route = hanan_grid_route((2, 200), (700, 700), obstacles,
+                                 canvas_width=1024, canvas_height=1024, margin=10)
+        self.assertIsNotNone(route)
+        self.assertTrue(self._orthogonal(route),
+                        f"route must stay orthogonal: {route}")
+        self.assertEqual(self._collisions(route, obstacles), [])
+
+    def test_m3_appended_end_does_not_pierce_obstacle(self):
+        # Without the guard the final (250,490)->(250,700) hop pierces the box.
+        obstacles = [[150, 600, 350, 700]]
+        route = hanan_grid_route((250, 100), (250, 700), obstacles,
+                                 canvas_width=600, canvas_height=500, margin=10)
+        self.assertIsNotNone(route)
+        self.assertEqual(self._collisions(route, obstacles), [])
+
+    def test_clamp_never_returns_worse_than_no_canvas(self):
+        # A route that exists without canvas bounds and lies fully on-canvas
+        # must also be found with bounds: clamping may not create a false None.
+        cases = [
+            (((83, 4), (525, 127), [[0, 7, 126, 64]]), 600, 500, 10),
+            (((127, 436), (39, 122),
+              [[6, 199, 157, 362], [104, 562, 206, 607]]), 210, 607, 15),
+        ]
+        for (start, end, obstacles), w, h, margin in cases:
+            plain = hanan_grid_route(start, end, obstacles)
+            bounded = hanan_grid_route(start, end, obstacles,
+                                       canvas_width=w, canvas_height=h,
+                                       margin=margin)
+            if plain is not None and all(0 <= p[0] <= w and 0 <= p[1] <= h
+                                         for p in plain):
+                self.assertIsNotNone(
+                    bounded, f"on-canvas route lost with canvas: {plain}")
+
+    def test_public_api_route_is_orthogonal_and_clear(self):
+        # Same defect through the public API: a border-flush port makes the
+        # Hanan fallback return a diagonal lead-in segment in the connector
+        # polyline. (Reproduces via compute_obstacle_avoidance_route.)
+        from_box = [242, 0, 328, 44]
+        to_box = [222, 0, 277, 41]
+        obstacles = [[110, 28, 268, 74], [13, 30, 87, 179], [240, 133, 302, 186]]
+        route = compute_obstacle_avoidance_route(
+            from_box, to_box, obstacles,
+            canvas_width=302, canvas_height=704, margin=10)
+        self.assertIsNotNone(route)
+        wpts = route["waypoints"]
+        self.assertTrue(self._orthogonal(wpts),
+                        f"waypoints must be orthogonal: {wpts}")
+        others = [o for o in obstacles if o != from_box and o != to_box]
+        self.assertEqual(self._collisions(wpts, others), [])
+
+
 if __name__ == "__main__":
     unittest.main()

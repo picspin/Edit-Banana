@@ -222,6 +222,25 @@ def hanan_grid_route(start_pt: Tuple[int, int], end_pt: Tuple[int, int],
     if canvas_height is not None:
         ys = {max(margin, min(canvas_height - margin, y)) for y in ys}
 
+    # Canvas bounds inset protection (Major 1). A terminal is the arrow's
+    # attachment point (a shape-box edge), so it must stay exact while it is
+    # on the canvas: the margin clamp above could otherwise push a
+    # border-flush port inside an obstacle body and lose the whole route.
+    # A derived clearance line that clamped into an obstacle body is left in
+    # place: the per-edge collision check below already rejects segments
+    # through it, and dropping the line outright would also discard the
+    # usable part of that line outside the obstacle (a false "no route").
+    if canvas_width is not None:
+        if 0 <= int(start_pt[0]) <= canvas_width:
+            xs.add(int(start_pt[0]))
+        if 0 <= int(end_pt[0]) <= canvas_width:
+            xs.add(int(end_pt[0]))
+    if canvas_height is not None:
+        if 0 <= int(start_pt[1]) <= canvas_height:
+            ys.add(int(start_pt[1]))
+        if 0 <= int(end_pt[1]) <= canvas_height:
+            ys.add(int(end_pt[1]))
+
     sorted_x = sorted(list(xs))
     sorted_y = sorted(list(ys))
 
@@ -236,8 +255,15 @@ def hanan_grid_route(start_pt: Tuple[int, int], end_pt: Tuple[int, int],
     start_node = (x_map[sx], y_map[sy])
     target_node = (x_map[ex], y_map[ey])
 
+    # Seed and terminate the A* path at the SNAPPED grid nodes, not the raw
+    # terminals (Major 2). When a terminal is off-canvas the grid snaps it
+    # inward, so mixing the raw point in would stitch on a non-orthogonal
+    # lead-in segment.
+    snapped_start = [sx, sy]
+    snapped_end = [ex, ey]
+
     counter = itertools.count()
-    pq = [(0, 0, next(counter), start_node[0], start_node[1], 0, [[int(start_pt[0]), int(start_pt[1])]])]
+    pq = [(0, 0, next(counter), start_node[0], start_node[1], 0, [snapped_start])]
     visited = {}
 
     while pq:
@@ -258,8 +284,18 @@ def hanan_grid_route(start_pt: Tuple[int, int], end_pt: Tuple[int, int],
                         simplified[-1] = pt
                         continue
                 simplified.append(pt)
-            if simplified[-1] != [int(end_pt[0]), int(end_pt[1])]:
-                simplified.append([int(end_pt[0]), int(end_pt[1])])
+            # Close at the exact terminal only when that final hop is
+            # orthogonal and collision-free (Major 3); otherwise the
+            # snapped end node already is the safe end point.
+            if simplified[-1] != snapped_end:
+                close_seg_ok = (
+                    (simplified[-1][0] == snapped_end[0]
+                     or simplified[-1][1] == snapped_end[1])
+                    and not any(segment_box_collision(simplified[-1], snapped_end, o, margin=0.0)
+                                for o in obstacles)
+                )
+                if close_seg_ok:
+                    simplified.append(snapped_end)
             return simplified
 
         neighbors = []
