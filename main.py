@@ -319,7 +319,9 @@ class Pipeline:
                         pts_xml = f'''\n    <Array as="points">\n{inner_pts}\n    </Array>'''
                     source_attr = f' source="{elem.source_id}"' if elem.source_id is not None else ""
                     target_attr = f' target="{elem.target_id}"' if elem.target_id is not None else ""
-                    edge_style = "edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;strokeColor=#000000;strokeWidth=2;"
+                    is_rounded = getattr(elem, 'is_rounded', bool(elem.vector_points))
+                    rounded_attr = "rounded=1;arcSize=10;" if is_rounded else "rounded=0;"
+                    edge_style = f"edgeStyle=orthogonalEdgeStyle;{rounded_attr}orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;strokeColor=#000000;strokeWidth=2;"
                     elem.layer_level = LayerLevel.ARROW.value
                     elem.xml_fragment = f'''<mxCell id="{elem.id}" parent="1" edge="1"{source_attr}{target_attr} style="{edge_style}">
   <mxGeometry relative="1" as="geometry">
