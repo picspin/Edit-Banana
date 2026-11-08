@@ -880,5 +880,95 @@ class TestHananCanvasClampRegression(unittest.TestCase):
         self.assertEqual(self._collisions(wpts, others), [])
 
 
+class TestM4AndMinorsRegression(unittest.TestCase):
+    """Regressions for M4 text performance and m1-m4, opt findings."""
+
+    def test_m4_dense_text_obstacles_performance(self):
+        import random, time
+        random.seed(42)
+        text_obs = [[random.randint(50, 500), random.randint(50, 500),
+                     random.randint(50, 500) + 40, random.randint(50, 500) + 20]
+                    for _ in range(100)]
+        obs = [[250, 180, 350, 320]]
+        t0 = time.perf_counter()
+        route = hanan_grid_route((150, 250), (450, 250), obs, clearance=25, text_obstacles=text_obs)
+        dt = time.perf_counter() - t0
+        self.assertLess(dt, 0.25, f"Dense text routing took {dt:.3f}s; expected < 0.25s")
+
+    def test_m1_negative_coordinates_text_xml(self):
+        ex = DetectionContourExtractor(fastsam_model_path="")
+        class Ctx:
+            def __init__(self):
+                self.image_path = SYNTH
+                self.elements = []
+                self.canvas_width = 600
+                self.canvas_height = 500
+                self.intermediate_results = {
+                    "text_xml": '<mxCell id="1"><mxGeometry x="-15.5" y="-10.5" width="80" height="30"/></mxCell>'
+                }
+        ctx = Ctx()
+        original_extract = ex.extract
+        ex.extract = lambda path, **kwargs: {
+            "canvas_width": 600, "canvas_height": 500,
+            "shapes": [{"bbox": [50, 100, 150, 200]}, {"bbox": [450, 100, 550, 200]}],
+            "arrows": [],
+            "yolo_boxes": [], "yolo_kept": [], "yolo_available": False, "yolo_error": None, "yolo_model": None,
+            "fastsam_masks": [], "fastsam_arrow_instances": [],
+            "fastsam_shapes_kept": [], "fastsam_shapes_dropped": [],
+            "fastsam_available": False, "fastsam_error": None, "fastsam_model": None,
+        }
+        try:
+            res = ex.process(ctx)
+            self.assertTrue(res.success)
+        finally:
+            ex.extract = original_extract
+
+    def test_m4_distinct_lanes_at_canvas_margin(self):
+        box_a = [50, 10, 150, 50]
+        box_b = [450, 10, 550, 50]
+        box_o = [250, 5, 350, 55]
+        r0 = compute_obstacle_avoidance_route(box_a, box_b, [box_o], clearance=25, lane_index=0,
+                                             canvas_width=600, canvas_height=100, margin=10)
+        r1 = compute_obstacle_avoidance_route(box_a, box_b, [box_o], clearance=25, lane_index=1,
+                                             canvas_width=600, canvas_height=100, margin=10)
+        self.assertIsNotNone(r0)
+        self.assertIsNotNone(r1)
+        self.assertNotEqual(r0["waypoints"][2][1], r1["waypoints"][2][1])
+
+    def test_opt_arrow_bbox_matches_abox(self):
+        ex = DetectionContourExtractor(fastsam_model_path="")
+        box_a = [50, 100, 150, 200]
+        box_b = [450, 100, 550, 200]
+        class Ctx:
+            def __init__(self):
+                self.image_path = SYNTH
+                self.elements = []
+                self.canvas_width = 600
+                self.canvas_height = 500
+                self.intermediate_results = {}
+        ctx = Ctx()
+        original_extract = ex.extract
+        ex.extract = lambda path, **kwargs: {
+            "canvas_width": 600, "canvas_height": 500,
+            "shapes": [{"bbox": box_a}, {"bbox": box_b}],
+            "arrows": [{
+                "from_box": box_a, "to_box": box_b,
+                "shaft_confirmed": True, "head_separated": False, "method": "test"
+            }],
+            "yolo_boxes": [], "yolo_kept": [], "yolo_available": False, "yolo_error": None, "yolo_model": None,
+            "fastsam_masks": [], "fastsam_arrow_instances": [],
+            "fastsam_shapes_kept": [], "fastsam_shapes_dropped": [],
+            "fastsam_available": False, "fastsam_error": None, "fastsam_model": None,
+        }
+        try:
+            res = ex.process(ctx)
+            arrow_elem = [e for e in ctx.elements if e.element_type == "arrow"][0]
+            self.assertNotEqual(arrow_elem.bbox.to_list(), box_b)
+            self.assertEqual(arrow_elem.bbox.x1, 150)
+            self.assertEqual(arrow_elem.bbox.x2, 450)
+        finally:
+            ex.extract = original_extract
+
+
 if __name__ == "__main__":
     unittest.main()
