@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Edit Banana Studio — 智能生图与矢量可编辑画板</title>
+  <link rel="stylesheet" href="/static/katex.min.css">
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script src="/static/katex.min.js"></script>
+<body>
+
+  <!-- Top Studio Header -->
+  <header class="studio-header">
+    <div class="brand">
+      <span class="brand-icon">🍌</span>
+      <div>
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <span class="brand-title">Edit Banana</span>
+          <span class="brand-badge">Studio V2</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- AI Generator Bar -->
+    <div class="generator-bar">
+      <select id="modelSelect" class="model-select" title="生图模型选择">
+        <option value="gemini-3.1-flash-image" selected>gemini-3.1-flash-image (推荐)</option>
+        <option value="gemini-3-pro-image">gemini-3-pro-image (高质量)</option>
+        <option value="qwen-image-2.0-pro">qwen-image-2.0-pro (通义多模态)</option>
+      </select>
+
+      <div class="prompt-input-wrapper">
+        <input 
+          type="text" 
+          id="promptInput" 
+          class="prompt-input" 
+          placeholder="输入结构图提示词，如：Three rectangular modules Client, Server, Database connected by arrows..."
+          value="A clean 2D software architecture diagram: Client, Server, Database boxes connected by arrows"
+        >
+      </div>
+
+      <button id="btnGenerate" class="btn btn-primary" title="一键调用 Magpie 网关生成图像并自动载入画板">
+        <span>✨ 一键生成图像</span>
+      </button>
+    </div>
+
+    <!-- Right Header Actions -->
+    <div class="header-actions">
+      <div class="dropdown" style="position: relative;">
+        <button id="btnAddElementDropdown" class="btn btn-secondary btn-sm" title="向当前画布添加新图元">
+          <span>➕ 添加图元 ▾</span>
+        </button>
+        <div id="addElementMenu" class="dropdown-menu" style="display: none; position: absolute; top: 100%; right: 0; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 8px; box-shadow: var(--shadow-lg); z-index: 60; min-width: 150px; padding: 6px; margin-top: 4px;">
+          <div class="menu-item" data-add="title">📌 标题 (Title)</div>
+          <div class="menu-item" data-add="module">🔲 模块图框 (Module)</div>
+          <div class="menu-item" data-add="content">📝 说明文本 (Content)</div>
+          <div class="menu-item" data-add="formula">📐 LaTeX 公式 (Math)</div>
+          <div class="menu-item" data-add="arrow">➡️ 矢量箭头 (Arrow)</div>
+          <div class="menu-item" data-add="symbol">⚛️ 符号徽标 (Symbol)</div>
+        </div>
+      </div>
+      <label class="btn btn-secondary btn-sm" title="从本地上传任意流程图或架构图图片" style="margin-bottom: 0;">
+        <span>📁 本地上传</span>
+        <input type="file" id="fileUpload" accept="image/*" style="display: none;">
+      </label>
+      <button id="btnLoadDemo" class="btn btn-secondary btn-sm" title="快速载入最近生成的标准架构图进行编辑">
+        <span>🎯 载入样例</span>
+      </button>
+      <div class="dropdown" style="position: relative;">
+        <button id="btnExportDropdown" class="btn btn-accent btn-sm" title="导出选项 (DrawIO XML / PNG / JPG)">
+          <span>💾 导出 ▾</span>
+        </button>
+        <div id="exportMenu" class="dropdown-menu" style="display: none; position: absolute; top: 100%; right: 0; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 8px; box-shadow: var(--shadow-lg); z-index: 60; min-width: 175px; padding: 6px; margin-top: 4px;">
+          <div class="menu-item" id="btnExportDrawio">💾 导出 DrawIO XML (.xml)</div>
+          <div class="menu-item" id="btnExportPNG">🖼️ 导出 PNG 渲染图片 (.png)</div>
+          <div class="menu-item" id="btnExportJPG">🖼️ 导出 JPG 渲染图片 (.jpg)</div>
+        </div>
+      </div>
+      <input type="file" id="replaceUploadInput" accept="image/*" style="display: none;">
+    </div>
+  </header>
+
+  <!-- Prompt Presets Strip -->
+  <div class="presets-strip">
+    <span class="presets-label">⚡ 快速生图预置:</span>
+    <span class="preset-chip" data-prompt="A minimalist 2D software architecture diagram on white background: Left box Client, middle box Web Server, right box SQL Database, connected by straight black arrows.">🏛️ 3层经典软件架构</span>
+    <span class="preset-chip" data-prompt="A clean 2D microservices workflow diagram: API Gateway routing to Order Service, Payment Service, and Inventory Service with crisp orthogonal connectors.">⚡ 微服务调用流</span>
+    <span class="preset-chip" data-prompt="A closed-loop system control flowchart: Input State leading to Feedback Controller, Plant, and Sensor with return feedback loop.">🔄 双向闭环反馈图</span>
+    <span class="preset-chip" data-prompt="A modern ETL data pipeline diagram: Data Ingestion, Kafka Stream, Spark Processing, and Data Warehouse with clean directional arrows.">📊 数据流与数仓管线</span>
+    <span class="preset-chip" data-prompt="A user authentication security flowchart: Login Form, Auth Guard, JWT Validator, User Session Store.">🔒 用户鉴权认证流</span>
+  </div>
+
+  <!-- Studio Main Body -->
+  <div class="studio-body">
+
+    <!-- Left Sidebar: Layer Tree & Category Tag Filters -->
+    <aside class="sidebar-left">
+      <div class="sidebar-header">
+        <span class="sidebar-title">图层与分类标签</span>
+        <span id="layerTotalCount" class="badge-shape" style="font-size: 11px;">0 元素</span>
+      </div>
+
+      <!-- Category Filter Buttons -->
+      <div class="tag-filter-group">
+        <button class="tag-filter-btn active" data-filter="all">全部 <span class="tag-count" id="countAll">0</span></button>
+        <button class="tag-filter-btn" data-filter="group_text">📝 文字 <span class="tag-count" id="countGroupText">0</span></button>
+        <button class="tag-filter-btn" data-filter="group_graphic">🖼️ 图 <span class="tag-count" id="countGroupGraphic">0</span></button>
+        <button class="tag-filter-btn" data-filter="group_line">➡️ 线 <span class="tag-count" id="countGroupLine">0</span></button>
+        <button class="tag-filter-btn" data-filter="title">📌 标题 <span class="tag-count" id="countTitle">0</span></button>
+        <button class="tag-filter-btn" data-filter="module">🔲 模块 <span class="tag-count" id="countModule">0</span></button>
+        <button class="tag-filter-btn" data-filter="formula">📐 公式 <span class="tag-count" id="countFormula">0</span></button>
+        <button class="tag-filter-btn" data-filter="image_patch">🖼️ 切片 <span class="tag-count" id="countImage">0</span></button>
+      </div>
+
+      <!-- Layer Items List -->
+      <div class="layer-list" id="layerList">
+        <div class="empty-state">
+          <div class="empty-icon">🎨</div>
+          <p>暂无元素<br>点击上方“一键生成”或“载入样例”</p>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Center Stage: Canvas & Interactive Vector Artboard -->
+    <main class="stage-container" id="stageContainer">
+      
+      <!-- Artboard Wrapper -->
+      <div class="artboard" id="artboard" style="width: 1024px; height: 1024px;">
+        <!-- Raster Background Image Overlay (with adjustable opacity) -->
+        <img id="artboardBgImg" class="artboard-bg-img" alt="Background Raster">
+
+        <!-- SVG Vector Artboard Stage -->
+        <svg id="svgStage" class="artboard-svg-stage" viewBox="0 0 1024 1024">
+          <defs id="svgDefs">
+            <!-- Arrow Marker Definition -->
+            <marker id="arrowHead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+              <polygon points="0 0, 10 3.5, 0 7" fill="#0f172a" />
+            </marker>
+            <marker id="arrowHeadSelected" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+              <polygon points="0 0, 10 3.5, 0 7" fill="#3b82f6" />
+            </marker>
+          </defs>
+          <g id="svgArrowsLayer"></g>
+          <g id="svgShapesLayer"></g>
+          <g id="svgTextsLayer"></g>
+        </svg>
+
+        <!-- Selection Bounding Box & Transform Handles -->
+        <div id="transformBox" class="transform-box">
+          <div class="resize-handle handle-nw" data-handle="nw"></div>
+          <div class="resize-handle handle-n" data-handle="n"></div>
+          <div class="resize-handle handle-ne" data-handle="ne"></div>
+          <div class="resize-handle handle-e" data-handle="e"></div>
+          <div class="resize-handle handle-se" data-handle="se"></div>
+          <div class="resize-handle handle-s" data-handle="s"></div>
+          <div class="resize-handle handle-sw" data-handle="sw"></div>
+          <div class="resize-handle handle-w" data-handle="w"></div>
+        </div>
+
+        <!-- Marquee Drag Selection Box -->
+        <div id="marqueeBox" class="marquee-box"></div>
+        <button id="marqueeActionBtn" class="marquee-action-btn">🔍 自动识别框内多层元素</button>
+      </div>
+
+      <div class="stage-hud">
+        <button id="btnToolSelect" class="hud-btn active" title="选择模式 (快捷键: V)">🎯 选择</button>
+        <button id="btnToolPan" class="hud-btn" title="抓手平移模式 (快捷键: H 或按住空格/鼠标拖动)">🖐️ 抓手</button>
+        <div class="hud-divider"></div>
+        <button id="btnZoomOut" class="hud-btn" title="缩小 (快捷键: -)">🔍 -</button>
+        <span id="zoomLevelText" style="font-size: 12px; font-weight: 600; min-width: 42px; text-align: center;">100%</span>
+        <button id="btnZoomIn" class="hud-btn" title="放大 (快捷键: +)">🔍 +</button>
+        <button id="btnZoomFit" class="hud-btn" title="自适应居中 (快捷键: F)">适应</button>
+        <div class="hud-divider"></div>
+        <button id="btnToggleYoloTags" class="hud-btn active" title="显示/隐藏 YOLO 多色检测框与图元标签">🏷️ 检测标签</button>
+        <button id="btnToggleOverlay" class="hud-btn" title="切换：高保真原图交互叠加 vs 纯矢量画板">👁️ 交互高亮模式</button>
+        <label class="hud-slider-label">
+          <span>底图:</span>
+          <input type="range" id="bgOpacitySlider" min="0" max="100" value="100" style="width: 60px; accent-color: var(--accent-banana); cursor: pointer;" title="原图透明度 0%~100%">
+        </label>
+        <div class="hud-divider"></div>
+        <span style="font-size: 11px; color: var(--text-dim);" id="selectionModeHint">💡 支持单选点选、框选与空格拖动画布</span>
+      </div>
+    </main>
+
+    <!-- Right Sidebar: Context Property Inspector -->
+    <aside class="sidebar-right" id="sidebarRight">
+      <div class="sidebar-header">
+        <span class="sidebar-title">属性与样式编辑</span>
+        <span id="selectionBadge" class="brand-badge" style="display: none;">1 选中</span>
+      </div>
+
+      <div class="inspector-body" id="inspectorBody">
+        <div class="empty-state">
+          <div class="empty-icon">👆</div>
+          <p>请在画板中点击元素进行点选<br>或在空白处拖拽进行框选</p>
+        </div>
+      </div>
+    </aside>
+
+  </div>
+
+  <!-- Photoshop-style Context Menu -->
+  <div id="contextMenu" class="context-menu">
+    <div class="context-menu-item" data-action="deep-scan">
+      <span>🔍 框选识别多层元素</span>
+      <span class="context-menu-shortcut">M</span>
+    </div>
+    <div class="context-menu-separator"></div>
+    <div class="context-menu-item" data-action="color">
+      <span>🎨 快速上色</span>
+      <span>▸</span>
+      <div class="context-submenu">
+        <div class="context-menu-item" data-color-action="text-blue">🔵 蓝色文字</div>
+        <div class="context-menu-item" data-color-action="text-emerald">🟢 绿色文字</div>
+        <div class="context-menu-item" data-color-action="text-amber">🟠 橙色文字</div>
+        <div class="context-menu-item" data-color-action="text-rose">🔴 红色文字</div>
+        <div class="context-menu-separator"></div>
+        <div class="context-menu-item" data-color-action="fill-sunset">🌅 日落渐变</div>
+        <div class="context-menu-item" data-color-action="fill-ocean">🌊 深蓝渐变</div>
+        <div class="context-menu-item" data-color-action="fill-emerald">🍃 薄荷渐变</div>
+        <div class="context-menu-item" data-color-action="fill-wireframe">👁️ 恢复透明线框</div>
+      </div>
+    </div>
+    <div class="context-menu-item" data-action="typography">
+      <span>🔤 文字排版</span>
+      <span>▸</span>
+      <div class="context-submenu">
+        <div class="context-menu-item" data-typo="size-up">➕ 增大字号 (+2)</div>
+        <div class="context-menu-item" data-typo="size-down">➖ 减小字号 (-2)</div>
+        <div class="context-menu-separator"></div>
+        <div class="context-menu-item" data-typo="font-inter">Inter 现代黑体</div>
+        <div class="context-menu-item" data-typo="font-georgia">Georgia 优雅衬线</div>
+        <div class="context-menu-item" data-typo="font-mono">Fira Code 等宽</div>
+        <div class="context-menu-item" data-typo="font-noto">思源黑体 (Noto)</div>
+        <div class="context-menu-separator"></div>
+        <div class="context-menu-item" data-typo="convert-latex">📐 转换为 LaTeX 公式</div>
+      </div>
+    </div>
+    <div class="context-menu-separator"></div>
+    <div class="context-menu-item" data-action="layer">
+      <span>📚 图层顺序</span>
+      <span>▸</span>
+      <div class="context-submenu">
+        <div class="context-menu-item" data-layer-action="bring-front">⏫ 置于顶层 <span class="context-menu-shortcut">]</span></div>
+        <div class="context-menu-item" data-layer-action="bring-forward">⬆️ 上移一层</div>
+        <div class="context-menu-item" data-layer-action="send-backward">⬇️ 下移一层</div>
+        <div class="context-menu-item" data-layer-action="send-back">⏬ 置于底层 <span class="context-menu-shortcut">[</span></div>
+      </div>
+    </div>
+    <div class="context-menu-separator"></div>
+    <div class="context-menu-item" data-action="duplicate">
+      <span>📄 复制图元</span>
+      <span class="context-menu-shortcut">Ctrl+D</span>
+    </div>
+    <div class="context-menu-item" data-action="replace">
+      <span>🔄 替换图元形态</span>
+    </div>
+    <div class="context-menu-separator"></div>
+    <div class="context-menu-item" data-action="upload-replace">
+      <span>📤 上传图片替换图元</span>
+    </div>
+    <div class="context-menu-item" data-action="ai-replace">
+      <span>✨ AI生图替换图元</span>
+    </div>
+    <div class="context-menu-separator"></div>
+    <div class="context-menu-item danger" data-action="delete">
+      <span>🗑️ 删除图元</span>
+      <span class="context-menu-shortcut">Del</span>
+    </div>
+  </div>
+
+  <!-- Toast Notification Container -->
+  <div class="toast-container" id="toastContainer"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

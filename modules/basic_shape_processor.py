@@ -1072,7 +1072,7 @@ def detect_rectangles_robust(cv2_image: np.ndarray, existing_elements: dict, con
         v_lines = []
         
         for line in lines:
-            x1_l, y1_l, x2_l, y2_l = line[0]
+            x1_l, y1_l, x2_l, y2_l = line.reshape(-1)[:4]
             angle = np.arctan2(y2_l - y1_l, x2_l - x1_l) * 180 / np.pi
             length = np.sqrt((x2_l - x1_l)**2 + (y2_l - y1_l)**2)
             

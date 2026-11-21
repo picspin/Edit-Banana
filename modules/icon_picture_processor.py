@@ -315,11 +315,13 @@ class IconPictureProcessor(BaseProcessor):
         )
     
     def _get_elements_to_process(self, elements: List[ElementInfo]) -> List[ElementInfo]:
-        """Filter elements to process (icons, arrows, etc.; arrows treated as icon crop)."""
+        """Filter elements to process (icons, arrows, etc.; vector arrows are skipped)."""
         all_types = set(IMAGE_PROMPT) | {"arrow", "line", "connector"}
         return [
             e for e in elements
-            if e.element_type.lower() in all_types and e.base64 is None
+            if e.element_type.lower() in all_types
+            and e.base64 is None
+            and not (e.arrow_start and e.arrow_end)
         ]
     
     def _process_element(self, elem: ElementInfo, original_image: Image.Image) -> bool:

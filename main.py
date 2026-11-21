@@ -18,7 +18,6 @@ import os
 import sys
 import argparse
 import warnings
-import yaml
 from pathlib import Path
 from typing import Optional, List
 
@@ -64,21 +63,27 @@ TEXT_MODULE_AVAILABLE = TextRestorer is not None
 
 # ======================== config ========================
 def load_config() -> dict:
-    """Load config/config.yaml."""
-    config_path = os.path.join(PROJECT_ROOT, "config", "config.yaml")
-    
-    if not os.path.exists(config_path):
-        print(f"Warning: config file not found at {config_path}, using defaults")
-        return {
-            'paths': {
-                'input_dir': './input',
-                'output_dir': './output',
-            }
+    """Load config/config.yaml or fall back to defaults."""
+    default_config = {
+        'paths': {
+            'input_dir': './input',
+            'output_dir': './output',
         }
-    
-    with open(config_path, 'r', encoding='utf-8') as f:
-        return yaml.safe_load(f)
+    }
+    config_path = os.path.join(PROJECT_ROOT, "config", "config.yaml")
+    if not os.path.exists(config_path):
+        return default_config
 
+    try:
+        import yaml
+        with open(config_path, 'r', encoding='utf-8') as f:
+            cfg = yaml.safe_load(f)
+            return cfg if isinstance(cfg, dict) else default_config
+    except ImportError:
+        return default_config
+    except Exception as e:
+        print(f"Warning: failed to load config ({e}), using defaults")
+        return default_config
 
 # ======================== pipeline ========================
 class Pipeline:
